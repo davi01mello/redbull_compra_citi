@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#070d16">
+  <title>Red Bull no CITi</title>
+  <link rel="stylesheet" href="/static/styles.css?v=20260802-2">
+</head>
+<body>
+  <main class="app-shell">
+    <section id="shop-view" class="view" aria-labelledby="shop-title">
+      <header class="screen-header">
+        <a class="brand" href="#/comprar" aria-label="CITi — início"><img src="/static/assets/logo-citi-transparent.png?v=20260802-2" alt="CITi"></a>
+      </header>
+
+      <div class="intro">
+        <p class="eyebrow">Autoatendimento</p>
+        <h1 id="shop-title">Escolha seu<br><span>Red Bull</span></h1>
+        <p>Selecione seus sabores e pague rapidinho com PIX.</p>
+      </div>
+
+      <form id="order-form" novalidate>
+        <div class="name-field">
+          <label for="buyer-name">Seu nome</label>
+          <div class="input-wrap">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 21a8 8 0 0 0-16 0M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z"/></svg>
+            <input id="buyer-name" required minlength="2" maxlength="80" autocomplete="name" placeholder="Digite seu nome" aria-describedby="name-error">
+          </div>
+          <small id="name-error" class="field-error" aria-live="polite"></small>
+        </div>
+
+        <div class="section-heading">
+          <h2>Escolha seus sabores</h2>
+          <span id="stock-note" aria-live="polite">Carregando...</span>
+        </div>
+
+        <div id="products" class="product-list" aria-live="polite" aria-busy="true">
+          <div class="product-skeleton"></div>
+          <div class="product-skeleton"></div>
+          <div class="product-skeleton"></div>
+        </div>
+
+        <aside class="checkout-panel" aria-label="Resumo do pedido">
+          <div class="total-row">
+            <span><b id="cart-count">0 itens</b><small>Total do pedido</small></span>
+            <strong id="cart-total">R$ 0,00</strong>
+          </div>
+          <button type="submit" id="checkout" disabled>
+            <span class="button-label">Pagar com PIX</span>
+            <span class="button-loader" aria-hidden="true"></span>
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
+          <p class="secure-note"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro e instantâneo</p>
+        </aside>
+      </form>
+    </section>
+
+    <section id="payment-view" class="view hidden" aria-labelledby="payment-title">
+      <div class="view-topline">
+        <button class="icon-button" id="back-shop" aria-label="Voltar para os produtos"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
+        <a class="brand brand-small" href="#/comprar" aria-label="CITi — início"><img src="/static/assets/logo-citi-transparent.png?v=20260802-2" alt=""></a>
+        <span class="topline-spacer"></span>
+      </div>
+
+      <div class="payment-heading">
+        <p class="eyebrow">Pedido criado</p>
+        <h1 id="payment-title">Pagamento PIX</h1>
+        <p>Escaneie o QR Code usando o app do seu banco.</p>
+      </div>
+
+      <div class="qr-card"><img id="qr-code" alt="QR Code para pagamento PIX"></div>
+
+      <div class="payment-summary">
+        <span>Valor a pagar</span>
+        <strong id="payment-total">R$ 0,00</strong>
+      </div>
+
+      <div class="status-pill" id="payment-status" role="status">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        Aguardando pagamento
+      </div>
+
+      <code id="pix-code" class="sr-only"></code>
+      <button class="outline-button" id="copy-pix">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="7" y="7" width="12" height="14" rx="2"/><path d="M15 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h2"/></svg>
+        <span>Copiar código PIX</span>
+      </button>
+
+      <div class="demo-box">
+        <div><strong>Ambiente de demonstração</strong><small>Nenhuma cobrança real será realizada.</small></div>
+        <button id="simulate-payment">Simular confirmação</button>
+      </div>
+
+      <p class="secure-note payment-secure"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro</p>
+    </section>
+
+    <section id="success-view" class="view hidden success" aria-labelledby="success-title">
+      <header class="screen-header"><span class="brand"><img src="/static/assets/logo-citi-transparent.png?v=20260802-2" alt="CITi"></span></header>
+      <div class="success-icon"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 12 4 4 8-9"/></svg></div>
+      <p class="eyebrow">Tudo certo!</p>
+      <h1 id="success-title">Pagamento<br><span>confirmado</span></h1>
+      <strong class="order-number" id="success-order">Pedido confirmado</strong>
+      <p class="success-copy">Pode retirar seu produto.</p>
+
+      <div class="receipt">
+        <div><span id="success-count">0 itens</span><strong id="success-total">R$ 0,00</strong></div>
+        <div id="success-items" class="receipt-items"></div>
+        <svg class="bag-icon" aria-hidden="true" viewBox="0 0 48 48"><path d="M12 16h24l2 26H10l2-26Z"/><path d="M18 18v-6a6 6 0 0 1 12 0v6"/></svg>
+      </div>
+
+      <button class="outline-button finish-button" id="new-order">Concluir</button>
+    </section>
+  </main>
+
+  <div id="toast" role="alert" aria-live="assertive"></div>
+  <script src="/static/app.js?v=20260802-2"></script>
+</body>
+</html>
