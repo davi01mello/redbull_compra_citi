@@ -2,6 +2,7 @@ const state = { products: [], cart: {}, order: null, loading: true, submitting: 
 const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
 const el = id => document.getElementById(id);
 const escapeHtml = value => String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
+const unitPriceForQuantity = quantity => quantity >= 4 ? 7.5 : quantity >= 2 ? 8 : 8.5;
 
 let toastTimer;
 function toast(message) {
@@ -98,10 +99,7 @@ function changeQuantity(id, delta) {
 function cartDetails() {
   const entries = Object.entries(state.cart).filter(([, quantity]) => quantity > 0);
   const count = entries.reduce((sum, [, quantity]) => sum + quantity, 0);
-  const total = entries.reduce((sum, [id, quantity]) => {
-    const product = state.products.find(item => item.id === id);
-    return sum + (product ? product.price * quantity : 0);
-  }, 0);
+  const total = count * unitPriceForQuantity(count);
   return { entries, count, total };
 }
 

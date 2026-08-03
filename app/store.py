@@ -10,10 +10,18 @@ from .models import Order, OrderCreate, OrderItem, OrderStatus, PaymentData, Pro
 
 
 INITIAL_PRODUCTS = {
-    "original": Product(id="original", name="Energy Original", description="O clássico que dá asas.", color="#164194", price=8.0, stock=24),
-    "tropical": Product(id="tropical", name="Tropical", description="Sabor tropical e refrescante.", color="#f5c400", price=8.0, stock=18),
-    "melancia": Product(id="melancia", name="Melancia", description="Leve, frutado e marcante.", color="#e7354f", price=8.0, stock=16),
+    "original": Product(id="original", name="Energy Original", description="O clássico que dá asas.", color="#164194", price=8.5, stock=24),
+    "tropical": Product(id="tropical", name="Tropical", description="Sabor tropical e refrescante.", color="#f5c400", price=8.5, stock=18),
+    "melancia": Product(id="melancia", name="Melancia", description="Leve, frutado e marcante.", color="#e7354f", price=8.5, stock=16),
 }
+
+
+def unit_price_for_quantity(quantity: int) -> float:
+    if quantity >= 4:
+        return 7.5
+    if quantity >= 2:
+        return 8.0
+    return 8.5
 
 
 class MemoryStore:
@@ -33,6 +41,8 @@ class MemoryStore:
             for item in payload.items:
                 requested[item.product_id] = requested.get(item.product_id, 0) + item.quantity
 
+            total_quantity = sum(requested.values())
+            unit_price = unit_price_for_quantity(total_quantity)
             items: list[OrderItem] = []
             for product_id, quantity in requested.items():
                 product = self.products.get(product_id)
@@ -40,7 +50,7 @@ class MemoryStore:
                     raise HTTPException(404, f"Produto '{product_id}' não encontrado")
                 if quantity > product.stock:
                     raise HTTPException(409, f"Estoque insuficiente para {product.name}")
-                items.append(OrderItem(product_id=product.id, product_name=product.name, quantity=quantity, unit_price=product.price, subtotal=round(product.price * quantity, 2)))
+                items.append(OrderItem(product_id=product.id, product_name=product.name, quantity=quantity, unit_price=unit_price, subtotal=round(unit_price * quantity, 2)))
 
             order_id = uuid4()
             txid = f"SIM-{order_id.hex[:16].upper()}"
