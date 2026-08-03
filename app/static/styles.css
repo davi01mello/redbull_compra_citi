@@ -153,6 +153,7 @@ h1 span { color: var(--green); }
 .payment-summary strong { color: var(--text); font-size: 20px; }
 .status-pill { display: flex; align-items: center; justify-content: center; gap: 9px; min-height: 52px; padding: 10px 16px; border: 1px solid var(--green); border-radius: 26px; color: var(--green); font-size: 14px; font-weight: 700; }
 .status-pill svg { width: 23px; }
+.status-pill.payment-failed { border-color: var(--error); color: var(--error); }
 .outline-button { display: flex; align-items: center; justify-content: center; gap: 11px; width: 100%; min-height: 54px; margin-top: 12px; padding: 10px 16px; border: 1px solid #526174; border-radius: 16px; background: var(--surface); color: var(--text); font-weight: 600; cursor: pointer; }
 .outline-button:hover { border-color: var(--green); }
 .outline-button svg { width: 21px; }

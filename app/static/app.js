@@ -1,4 +1,4 @@
-const state = { products: [], cart: {}, order: null, loading: true, submitting: false };
+const state = { products: [], cart: {}, order: null, loading: true, submitting: false, pollTimer: null };
 const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
 const el = id => document.getElementById(id);
 const escapeHtml = value => String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
@@ -150,6 +150,45 @@ function renderSuccess() {
   el('success-items').innerHTML = state.order.items.map(item => `${item.quantity}× ${escapeHtml(item.product_name.replace('Energy ', ''))}`).join('<br>');
 }
 
+function stopPaymentPolling() {
+  if (state.pollTimer) clearTimeout(state.pollTimer);
+  state.pollTimer = null;
+}
+
+function setPaymentStatus(message, failed = false) {
+  el('payment-status').textContent = message;
+  el('payment-status').classList.toggle('payment-failed', failed);
+}
+
+async function pollPayment() {
+  if (!state.order) return;
+  try {
+    const current = await api(`/api/orders/${state.order.id}`);
+    state.order = current;
+    if (current.status === 'PAID') {
+      stopPaymentPolling();
+      renderSuccess();
+      show('success');
+      return;
+    }
+    if (['EXPIRED', 'FAILED', 'CANCELLED'].includes(current.status)) {
+      stopPaymentPolling();
+      setPaymentStatus(current.status === 'EXPIRED' ? 'Cobrança expirada' : 'Não foi possível concluir', true);
+      toast('Este pedido não está mais disponível. Crie um novo pedido.');
+      return;
+    }
+  } catch (_) {
+    // Uma falha transitória não deve interromper a espera pelo webhook.
+  }
+  state.pollTimer = setTimeout(pollPayment, 2000);
+}
+
+function startPaymentPolling() {
+  stopPaymentPolling();
+  setPaymentStatus('Aguardando pagamento');
+  state.pollTimer = setTimeout(pollPayment, 1500);
+}
+
 el('buyer-name').addEventListener('input', () => validateForm(false));
 el('buyer-name').addEventListener('blur', () => validName(true));
 
@@ -163,10 +202,15 @@ el('order-form').addEventListener('submit', async event => {
       method: 'POST',
       body: JSON.stringify({ buyer_name: el('buyer-name').value.trim(), items })
     });
+    if (!state.order.payment) throw new Error('A cobrança PIX não foi gerada.');
     el('qr-code').src = state.order.payment.qr_code;
     el('pix-code').textContent = state.order.payment.copy_paste;
     el('payment-total').textContent = money(state.order.total);
+    el('demo-box').classList.toggle('hidden', !state.order.payment.simulated);
+    el('static-pix-box').classList.toggle('hidden', state.order.payment.automatic_confirmation);
     show('payment');
+    if (state.order.payment.automatic_confirmation) startPaymentPolling();
+    else setPaymentStatus('PIX pronto para pagamento');
   } catch (error) {
     toast(error.message);
     await loadProducts().catch(() => {});
@@ -187,14 +231,13 @@ el('copy-pix').addEventListener('click', async () => {
 });
 
 el('simulate-payment').addEventListener('click', async () => {
-  if (!state.order) return;
+  if (!state.order || !state.order.payment?.simulated) return;
   const button = el('simulate-payment');
   try {
     button.disabled = true;
     button.textContent = 'Confirmando...';
     await api(`/api/mock/pay/${state.order.payment.txid}`, { method: 'POST' });
-    renderSuccess();
-    show('success');
+    await pollPayment();
   } catch (error) {
     toast(error.message);
     button.disabled = false;
@@ -202,13 +245,16 @@ el('simulate-payment').addEventListener('click', async () => {
   }
 });
 
-el('back-shop').addEventListener('click', () => show('shop'));
+el('back-shop').addEventListener('click', () => { stopPaymentPolling(); show('shop'); });
 el('new-order').addEventListener('click', async () => {
+  stopPaymentPolling();
   state.cart = {};
   state.order = null;
   el('order-form').reset();
   el('simulate-payment').disabled = false;
   el('simulate-payment').textContent = 'Simular confirmação';
+  el('demo-box').classList.add('hidden');
+  el('static-pix-box').classList.add('hidden');
   await loadProducts().catch(error => toast(error.message));
   location.hash = '#/comprar';
   show('shop');

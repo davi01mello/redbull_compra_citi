@@ -3,3 +3,7 @@ uvicorn[standard]==0.35.0
 pydantic==2.11.7
 pytest==8.4.1
 httpx==0.28.1
+SQLAlchemy==2.0.41
+psycopg[binary]==3.2.9
+qrcode[pil]==8.2
+python-dotenv==1.2.2

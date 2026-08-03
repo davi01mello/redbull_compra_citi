@@ -87,9 +87,13 @@
         <span>Copiar código PIX</span>
       </button>
 
-      <div class="demo-box">
+      <div class="demo-box hidden" id="demo-box">
         <div><strong>Ambiente de demonstração</strong><small>Nenhuma cobrança real será realizada.</small></div>
         <button id="simulate-payment">Simular confirmação</button>
+      </div>
+
+      <div class="demo-box hidden" id="static-pix-box">
+        <div><strong>PIX real temporário</strong><small>O valor vai para a chave configurada, mas este modo não confirma o recebimento automaticamente.</small></div>
       </div>
 
       <p class="secure-note payment-secure"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro</p>

@@ -6,8 +6,12 @@ from pydantic import BaseModel, Field
 
 
 class OrderStatus(StrEnum):
+    PAYMENT_CREATING = "PAYMENT_CREATING"
     PENDING = "PENDING"
     PAID = "PAID"
+    EXPIRED = "EXPIRED"
+    CANCELLED = "CANCELLED"
+    FAILED = "FAILED"
 
 
 class Product(BaseModel):
@@ -41,7 +45,9 @@ class PaymentData(BaseModel):
     txid: str
     qr_code: str
     copy_paste: str
-    simulated: bool = True
+    simulated: bool
+    automatic_confirmation: bool = True
+    expires_at: datetime | None = None
 
 
 class Order(BaseModel):
@@ -52,10 +58,4 @@ class Order(BaseModel):
     status: OrderStatus
     created_at: datetime
     paid_at: datetime | None = None
-    payment: PaymentData
-
-
-class WebhookPayload(BaseModel):
-    txid: str
-    event: str = "PIX_PAID"
-
+    payment: PaymentData | None = None

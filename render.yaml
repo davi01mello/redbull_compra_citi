@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: redbull-pdv-citi
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: redbull-pdv-db
+          property: connectionString
+      - key: PAYMENT_PROVIDER
+        value: mock
+      - key: OPENPIX_ENVIRONMENT
+        value: sandbox
+      - key: OPENPIX_APP_ID
+        sync: false
+      - key: OPENPIX_WEBHOOK_SECRET
+        sync: false
+      - key: PIX_KEY
+        sync: false
+      - key: PIX_RECEIVER_NAME
+        sync: false
+      - key: PIX_RECEIVER_CITY
+        value: Fortaleza
+      - key: CHARGE_EXPIRES_IN
+        value: 600
+
+databases:
+  - name: redbull-pdv-db
+    plan: free
+    databaseName: redbull_pdv
