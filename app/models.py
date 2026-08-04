@@ -94,3 +94,14 @@ class WebhookPayload(BaseModel):
     txid: str
     event: str = "PIX_PAID"
 
+
+class MercadoPagoWebhookData(BaseModel):
+    id: str | int
+
+
+class MercadoPagoWebhookPayload(BaseModel):
+    id: str | int
+    type: str = Field(default="payment", max_length=120)
+    action: str = Field(default="payment.updated", max_length=120)
+    data: MercadoPagoWebhookData
+

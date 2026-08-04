@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,23 +12,34 @@ from .db.base import get_db
 from .models import (
     Order,
     OrderCreate,
+    MercadoPagoWebhookPayload,
     PriceTier,
     PricingAudience,
     Product,
     WebhookPayload,
 )
-from .payments import create_payment_provider
-from .payment_service import PaymentServiceError, create_order_with_payment
+from .payments import (
+    PaymentProviderError,
+    create_payment_provider,
+    verify_mercadopago_signature,
+)
+from .payment_service import (
+    PaymentServiceError,
+    create_order_with_payment,
+    process_mercadopago_payment,
+)
 from .store import store
 
 BASE_DIR = Path(__file__).resolve().parent
 WEBHOOK_TOKEN = "mvp-local-token"
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     payment_provider = create_payment_provider(settings)
     app.state.payment_provider = payment_provider
+    app.state.payment_settings = settings
     try:
         yield
     finally:
@@ -94,6 +106,65 @@ async def pix_webhook(
         return {"received": True, "processed": False, "reason": "Evento ignorado"}
     order, processed = await store.confirm_payment(db, payload.txid)
     return {"received": True, "processed": processed, "order_id": str(order.id), "status": order.status}
+
+
+@app.post("/api/webhooks/mercadopago")
+async def mercadopago_webhook(
+    payload: MercadoPagoWebhookPayload,
+    request: Request,
+    x_signature: str | None = Header(None),
+    x_request_id: str | None = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    payment_id = str(payload.data.id)
+    webhook_secret = request.app.state.payment_settings.mercadopago_webhook_secret
+    if not verify_mercadopago_signature(
+        x_signature,
+        x_request_id,
+        payment_id,
+        webhook_secret,
+    ):
+        raise HTTPException(401, "Assinatura do webhook inválida")
+
+    try:
+        provider_payment = await request.app.state.payment_provider.get_payment(
+            payment_id
+        )
+    except PaymentProviderError as exc:
+        logger.warning(
+            "Falha ao consultar pagamento Mercado Pago payment_id=%s: %s",
+            payment_id,
+            exc,
+        )
+        raise HTTPException(503, "Não foi possível confirmar o pagamento") from exc
+
+    result = await process_mercadopago_payment(
+        db,
+        event_id=str(payload.id),
+        event_type=payload.action or payload.type,
+        webhook_payment_id=payment_id,
+        provider_payment=provider_payment,
+    )
+    if result.outcome in {"already_paid", "not_approved", "unknown_payment"}:
+        logger.info(
+            "Webhook Mercado Pago reconhecido: outcome=%s payment_id=%s order_id=%s",
+            result.outcome,
+            payment_id,
+            result.order_id,
+        )
+    elif result.outcome != "approved":
+        logger.warning(
+            "Webhook Mercado Pago não processado: outcome=%s payment_id=%s order_id=%s",
+            result.outcome,
+            payment_id,
+            result.order_id,
+        )
+    return {
+        "received": True,
+        "processed": result.processed,
+        "outcome": result.outcome,
+        "order_id": str(result.order_id) if result.order_id else None,
+    }
 
 
 @app.post("/api/mock/pay/{txid}")

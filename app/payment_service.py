@@ -1,24 +1,48 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .db.models import OrderORM, PaymentORM
+from .db.models import (
+    OrderItemORM,
+    OrderORM,
+    PaymentORM,
+    ProductORM,
+    WebhookEventORM,
+)
 from .models import (
     Order,
     OrderCreate,
+    OrderStatus,
     PaymentProvider as PaymentProviderName,
     PaymentStatus,
     ReservationStatus,
 )
-from .payments import ChargeResult, PaymentProvider, PaymentProviderError
+from .payments import (
+    ChargeResult,
+    PaymentProvider,
+    PaymentProviderError,
+    PaymentResult,
+)
 from .store import store
 
 
 class PaymentServiceError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class WebhookProcessingResult:
+    outcome: str
+    order_id: UUID | None = None
+
+    @property
+    def processed(self) -> bool:
+        return self.outcome == "approved"
 
 
 def payment_idempotency_key(order_id: UUID) -> str:
@@ -186,3 +210,157 @@ async def create_order_with_payment(
 ) -> Order:
     reserved_order = await store.reserve_order(db, payload)
     return await ensure_order_payment(db, reserved_order.id, provider)
+
+
+async def _record_webhook_event(
+    db: AsyncSession,
+    event_id: str,
+    event_type: str,
+    provider_payment_id: str,
+) -> None:
+    statement = (
+        insert(WebhookEventORM)
+        .values(
+            provider=PaymentProviderName.MERCADOPAGO,
+            event_id=event_id,
+            event_type=event_type,
+            provider_payment_id=provider_payment_id,
+            processed_at=datetime.now(UTC),
+        )
+        .on_conflict_do_nothing(index_elements=["provider", "event_id"])
+    )
+    await db.execute(statement)
+
+
+async def process_mercadopago_payment(
+    db: AsyncSession,
+    event_id: str,
+    event_type: str,
+    webhook_payment_id: str,
+    provider_payment: PaymentResult,
+) -> WebhookProcessingResult:
+    async with db.begin():
+        if provider_payment.provider_payment_id != webhook_payment_id:
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("provider_id_mismatch")
+
+        payment_reference = (
+            await db.execute(
+                select(PaymentORM.id, PaymentORM.order_id)
+                .where(
+                    PaymentORM.provider
+                    == PaymentProviderName.MERCADOPAGO,
+                    PaymentORM.provider_payment_id == webhook_payment_id,
+                )
+            )
+        ).one_or_none()
+        if payment_reference is None:
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("unknown_payment")
+
+        payment_id, order_id = payment_reference
+        if provider_payment.status.upper() != "APPROVED":
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("not_approved", order_id)
+        if provider_payment.approved_at is None:
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("missing_approved_at", order_id)
+
+        order = (
+            await db.execute(
+                select(OrderORM).where(OrderORM.id == order_id).with_for_update()
+            )
+        ).scalar_one()
+        payment = (
+            await db.execute(
+                select(PaymentORM)
+                .where(PaymentORM.id == payment_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+
+        if order.status == OrderStatus.PAID:
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("already_paid", order_id)
+        if payment.status == PaymentStatus.APPROVED:
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("inconsistent_payment_state", order_id)
+        if order.reservation_status != ReservationStatus.ACTIVE:
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("reservation_not_active", order_id)
+        if Decimal(payment.amount) != provider_payment.amount:
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("amount_mismatch", order_id)
+
+        items = list(
+            (
+                await db.execute(
+                    select(OrderItemORM)
+                    .where(OrderItemORM.order_id == order_id)
+                    .order_by(OrderItemORM.product_id)
+                )
+            ).scalars()
+        )
+        quantities: dict[str, int] = {}
+        for item in items:
+            quantities[item.product_id] = (
+                quantities.get(item.product_id, 0) + item.quantity
+            )
+
+        product_ids = sorted(quantities)
+        products = {
+            product.id: product
+            for product in (
+                await db.execute(
+                    select(ProductORM)
+                    .where(ProductORM.id.in_(product_ids))
+                    .order_by(ProductORM.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        }
+        for product_id in product_ids:
+            product = products.get(product_id)
+            quantity = quantities[product_id]
+            if (
+                product is None
+                or product.reserved_stock < quantity
+                or product.stock < quantity
+            ):
+                await _record_webhook_event(
+                    db, event_id, event_type, webhook_payment_id
+                )
+                return WebhookProcessingResult("inconsistent_stock", order_id)
+
+        for product_id in product_ids:
+            quantity = quantities[product_id]
+            products[product_id].reserved_stock -= quantity
+            products[product_id].stock -= quantity
+
+        payment.status = PaymentStatus.APPROVED
+        payment.approved_at = provider_payment.approved_at
+        payment.updated_at = provider_payment.approved_at
+        order.status = OrderStatus.PAID
+        order.paid_at = provider_payment.approved_at
+        order.reservation_status = ReservationStatus.CONSUMED
+        await _record_webhook_event(db, event_id, event_type, webhook_payment_id)
+        await db.flush()
+
+        return WebhookProcessingResult("approved", order_id)
