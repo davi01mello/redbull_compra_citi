@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -8,8 +9,9 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
-from .db.base import get_db
+from .db.base import AsyncSessionLocal, get_db
 from .models import (
+    ManualReview,
     Order,
     OrderCreate,
     MercadoPagoWebhookPayload,
@@ -26,6 +28,8 @@ from .payments import (
 from .payment_service import (
     PaymentServiceError,
     create_order_with_payment,
+    expire_due_payments,
+    list_manual_reviews,
     process_mercadopago_payment,
 )
 from .store import store
@@ -35,14 +39,37 @@ WEBHOOK_TOKEN = "mvp-local-token"
 logger = logging.getLogger(__name__)
 
 
+async def _expiration_loop(interval_seconds: int) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            async with AsyncSessionLocal() as db:
+                expired = await expire_due_payments(db)
+            if expired:
+                logger.info("Cobranças expiradas e reservas liberadas: %s", expired)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Falha na rotina periódica de expiração de cobranças")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     payment_provider = create_payment_provider(settings)
     app.state.payment_provider = payment_provider
     app.state.payment_settings = settings
+    expiration_task = asyncio.create_task(
+        _expiration_loop(settings.payment_expiration_check_interval),
+        name="payment-expiration-loop",
+    )
     try:
         yield
     finally:
+        expiration_task.cancel()
+        try:
+            await expiration_task
+        except asyncio.CancelledError:
+            pass
         await payment_provider.aclose()
 
 
@@ -92,6 +119,14 @@ async def create_order(
 @app.get("/api/orders/{order_id}", response_model=Order)
 async def get_order(order_id: str, db: AsyncSession = Depends(get_db)) -> Order:
     return await store.get_order(db, order_id)
+
+
+@app.get("/api/manual-reviews", response_model=list[ManualReview])
+async def manual_reviews(
+    unresolved_only: bool = True,
+    db: AsyncSession = Depends(get_db),
+) -> list[ManualReview]:
+    return await list_manual_reviews(db, unresolved_only)
 
 
 @app.post("/api/webhooks/pix")
@@ -152,9 +187,17 @@ async def mercadopago_webhook(
             payment_id,
             result.order_id,
         )
-    elif result.outcome != "approved":
+    elif not result.processed:
         logger.warning(
             "Webhook Mercado Pago não processado: outcome=%s payment_id=%s order_id=%s",
+            result.outcome,
+            payment_id,
+            result.order_id,
+        )
+    elif result.outcome != "approved":
+        logger.info(
+            "Pagamento tardio Mercado Pago confirmado: outcome=%s "
+            "payment_id=%s order_id=%s",
             result.outcome,
             payment_id,
             result.order_id,

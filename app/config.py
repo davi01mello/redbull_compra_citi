@@ -15,6 +15,7 @@ class Settings:
     mercadopago_webhook_secret: str
     payment_provider: str
     charge_expires_in: int
+    payment_expiration_check_interval: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -24,6 +25,14 @@ class Settings:
         except ValueError as exc:
             raise RuntimeError("CHARGE_EXPIRES_IN deve ser um número inteiro") from exc
 
+        raw_check_interval = os.getenv("PAYMENT_EXPIRATION_CHECK_INTERVAL", "60")
+        try:
+            payment_expiration_check_interval = int(raw_check_interval)
+        except ValueError as exc:
+            raise RuntimeError(
+                "PAYMENT_EXPIRATION_CHECK_INTERVAL deve ser um número inteiro"
+            ) from exc
+
         return cls(
             mercadopago_access_token=os.getenv("MERCADOPAGO_ACCESS_TOKEN", "").strip(),
             mercadopago_webhook_secret=os.getenv(
@@ -31,6 +40,7 @@ class Settings:
             ).strip(),
             payment_provider=os.getenv("PAYMENT_PROVIDER", "mock").strip().lower(),
             charge_expires_in=charge_expires_in,
+            payment_expiration_check_interval=payment_expiration_check_interval,
         )
 
     def validate(self) -> None:
@@ -39,6 +49,10 @@ class Settings:
             raise RuntimeError(f"PAYMENT_PROVIDER deve ser uma destas opções: {allowed}")
         if self.charge_expires_in <= 0:
             raise RuntimeError("CHARGE_EXPIRES_IN deve ser maior que zero")
+        if self.payment_expiration_check_interval <= 0:
+            raise RuntimeError(
+                "PAYMENT_EXPIRATION_CHECK_INTERVAL deve ser maior que zero"
+            )
         if self.payment_provider == "mercadopago":
             missing = [
                 name

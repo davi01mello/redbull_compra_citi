@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db.models import (
+    ManualReviewORM,
     OrderItemORM,
     OrderORM,
     PaymentORM,
@@ -15,6 +16,8 @@ from .db.models import (
     WebhookEventORM,
 )
 from .models import (
+    ManualReview,
+    ManualReviewReason,
     Order,
     OrderCreate,
     OrderStatus,
@@ -42,7 +45,11 @@ class WebhookProcessingResult:
 
     @property
     def processed(self) -> bool:
-        return self.outcome == "approved"
+        return self.outcome in {
+            "approved",
+            "approved_late",
+            "approved_late_stock_conflict",
+        }
 
 
 def payment_idempotency_key(order_id: UUID) -> str:
@@ -232,6 +239,165 @@ async def _record_webhook_event(
     await db.execute(statement)
 
 
+async def _flag_manual_review(
+    db: AsyncSession,
+    order_id: UUID,
+    reason: ManualReviewReason,
+    details: str | None = None,
+) -> None:
+    statement = (
+        insert(ManualReviewORM)
+        .values(
+            id=uuid4(),
+            order_id=order_id,
+            reason=reason.value,
+            details=details,
+            created_at=datetime.now(UTC),
+        )
+        .on_conflict_do_nothing(index_elements=["order_id", "reason"])
+    )
+    await db.execute(statement)
+
+
+async def list_manual_reviews(
+    db: AsyncSession,
+    unresolved_only: bool = True,
+) -> list[ManualReview]:
+    statement = (
+        select(ManualReviewORM, OrderORM.buyer_name)
+        .join(OrderORM, OrderORM.id == ManualReviewORM.order_id)
+        .order_by(ManualReviewORM.created_at)
+    )
+    if unresolved_only:
+        statement = statement.where(ManualReviewORM.resolved_at.is_(None))
+    rows = (await db.execute(statement)).all()
+    return [
+        ManualReview(
+            id=review.id,
+            order_id=review.order_id,
+            buyer_name=buyer_name,
+            reason=ManualReviewReason(review.reason),
+            details=review.details,
+            created_at=review.created_at,
+            resolved_at=review.resolved_at,
+        )
+        for review, buyer_name in rows
+    ]
+
+
+async def _load_quantities(
+    db: AsyncSession,
+    order_id: UUID,
+) -> dict[str, int]:
+    items = list(
+        (
+            await db.execute(
+                select(OrderItemORM)
+                .where(OrderItemORM.order_id == order_id)
+                .order_by(OrderItemORM.product_id)
+            )
+        ).scalars()
+    )
+    quantities: dict[str, int] = {}
+    for item in items:
+        quantities[item.product_id] = quantities.get(item.product_id, 0) + item.quantity
+    return quantities
+
+
+async def _lock_products(
+    db: AsyncSession,
+    product_ids: list[str],
+) -> dict[str, ProductORM]:
+    return {
+        product.id: product
+        for product in (
+            await db.execute(
+                select(ProductORM)
+                .where(ProductORM.id.in_(product_ids))
+                .order_by(ProductORM.id)
+                .with_for_update()
+            )
+        ).scalars()
+    }
+
+
+async def expire_due_payments(
+    db: AsyncSession,
+    as_of: datetime | None = None,
+) -> int:
+    cutoff = as_of or datetime.now(UTC)
+    async with db.begin():
+        candidate_order_ids = list(
+            (
+                await db.execute(
+                    select(PaymentORM.order_id)
+                    .where(
+                        PaymentORM.status.in_(
+                            {
+                                PaymentStatus.CREATING,
+                                PaymentStatus.WAITING_PAYMENT,
+                            }
+                        ),
+                        PaymentORM.expires_at.is_not(None),
+                        PaymentORM.expires_at <= cutoff,
+                    )
+                    .order_by(PaymentORM.expires_at, PaymentORM.order_id)
+                )
+            ).scalars()
+        )
+
+    expired = 0
+    for order_id in candidate_order_ids:
+        async with db.begin():
+            order = (
+                await db.execute(
+                    select(OrderORM)
+                    .where(OrderORM.id == order_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            payment = (
+                await db.execute(
+                    select(PaymentORM)
+                    .where(PaymentORM.order_id == order_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if (
+                order is None
+                or payment is None
+                or order.status == OrderStatus.PAID
+                or payment.status
+                not in {PaymentStatus.CREATING, PaymentStatus.WAITING_PAYMENT}
+                or payment.expires_at is None
+                or payment.expires_at > cutoff
+            ):
+                continue
+
+            if order.reservation_status == ReservationStatus.ACTIVE:
+                quantities = await _load_quantities(db, order_id)
+                product_ids = sorted(quantities)
+                products = await _lock_products(db, product_ids)
+                for product_id in product_ids:
+                    product = products.get(product_id)
+                    quantity = quantities[product_id]
+                    if product is None or product.reserved_stock < quantity:
+                        raise RuntimeError(
+                            f"Reserva inconsistente para o produto '{product_id}'"
+                        )
+                for product_id in product_ids:
+                    products[product_id].reserved_stock -= quantities[product_id]
+                order.reservation_status = ReservationStatus.RELEASED
+
+            payment.status = PaymentStatus.EXPIRED
+            payment.updated_at = cutoff
+            await db.flush()
+            expired += 1
+
+    return expired
+
+
 async def process_mercadopago_payment(
     db: AsyncSession,
     event_id: str,
@@ -269,6 +435,12 @@ async def process_mercadopago_payment(
             )
             return WebhookProcessingResult("not_approved", order_id)
         if provider_payment.approved_at is None:
+            await _flag_manual_review(
+                db,
+                order_id,
+                ManualReviewReason.MISSING_APPROVED_AT,
+                "O provedor informou pagamento aprovado sem date_approved.",
+            )
             await _record_webhook_event(
                 db, event_id, event_type, webhook_payment_id
             )
@@ -298,61 +470,84 @@ async def process_mercadopago_payment(
                 db, event_id, event_type, webhook_payment_id
             )
             return WebhookProcessingResult("inconsistent_payment_state", order_id)
-        if order.reservation_status != ReservationStatus.ACTIVE:
-            await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
-            )
-            return WebhookProcessingResult("reservation_not_active", order_id)
         if Decimal(payment.amount) != provider_payment.amount:
+            await _flag_manual_review(
+                db,
+                order_id,
+                ManualReviewReason.AMOUNT_MISMATCH,
+                f"Esperado {payment.amount} {payment.currency}; recebido "
+                f"{provider_payment.amount} {provider_payment.currency}.",
+            )
             await _record_webhook_event(
                 db, event_id, event_type, webhook_payment_id
             )
             return WebhookProcessingResult("amount_mismatch", order_id)
 
-        items = list(
-            (
-                await db.execute(
-                    select(OrderItemORM)
-                    .where(OrderItemORM.order_id == order_id)
-                    .order_by(OrderItemORM.product_id)
-                )
-            ).scalars()
+        late_after_expiration = (
+            order.reservation_status == ReservationStatus.RELEASED
+            and payment.status == PaymentStatus.EXPIRED
         )
-        quantities: dict[str, int] = {}
-        for item in items:
-            quantities[item.product_id] = (
-                quantities.get(item.product_id, 0) + item.quantity
+        if (
+            order.reservation_status != ReservationStatus.ACTIVE
+            and not late_after_expiration
+        ):
+            await _flag_manual_review(
+                db,
+                order_id,
+                ManualReviewReason.RESERVATION_NOT_ACTIVE,
+                f"Reserva {order.reservation_status.value} com pagamento local "
+                f"{payment.status.value}.",
             )
+            await _record_webhook_event(
+                db, event_id, event_type, webhook_payment_id
+            )
+            return WebhookProcessingResult("reservation_not_active", order_id)
 
+        quantities = await _load_quantities(db, order_id)
         product_ids = sorted(quantities)
-        products = {
-            product.id: product
-            for product in (
-                await db.execute(
-                    select(ProductORM)
-                    .where(ProductORM.id.in_(product_ids))
-                    .order_by(ProductORM.id)
-                    .with_for_update()
+        products = await _lock_products(db, product_ids)
+        outcome = "approved"
+        if late_after_expiration:
+            conflicts: list[str] = []
+            for product_id in product_ids:
+                product = products.get(product_id)
+                quantity = quantities[product_id]
+                if (
+                    product is None
+                    or product.stock - product.reserved_stock < quantity
+                ):
+                    conflicts.append(product_id)
+                else:
+                    product.stock -= quantity
+            if conflicts:
+                await _flag_manual_review(
+                    db,
+                    order_id,
+                    ManualReviewReason.LATE_PAYMENT_STOCK_CONFLICT,
+                    "Sem estoque não reservado suficiente para: "
+                    + ", ".join(conflicts),
                 )
-            ).scalars()
-        }
-        for product_id in product_ids:
-            product = products.get(product_id)
-            quantity = quantities[product_id]
-            if (
-                product is None
-                or product.reserved_stock < quantity
-                or product.stock < quantity
-            ):
-                await _record_webhook_event(
-                    db, event_id, event_type, webhook_payment_id
-                )
-                return WebhookProcessingResult("inconsistent_stock", order_id)
+                outcome = "approved_late_stock_conflict"
+            else:
+                outcome = "approved_late"
+        else:
+            for product_id in product_ids:
+                product = products.get(product_id)
+                quantity = quantities[product_id]
+                if (
+                    product is None
+                    or product.reserved_stock < quantity
+                    or product.stock < quantity
+                ):
+                    await _record_webhook_event(
+                        db, event_id, event_type, webhook_payment_id
+                    )
+                    return WebhookProcessingResult("inconsistent_stock", order_id)
 
-        for product_id in product_ids:
-            quantity = quantities[product_id]
-            products[product_id].reserved_stock -= quantity
-            products[product_id].stock -= quantity
+            for product_id in product_ids:
+                quantity = quantities[product_id]
+                products[product_id].reserved_stock -= quantity
+                products[product_id].stock -= quantity
 
         payment.status = PaymentStatus.APPROVED
         payment.approved_at = provider_payment.approved_at
@@ -363,4 +558,4 @@ async def process_mercadopago_payment(
         await _record_webhook_event(db, event_id, event_type, webhook_payment_id)
         await db.flush()
 
-        return WebhookProcessingResult("approved", order_id)
+        return WebhookProcessingResult(outcome, order_id)

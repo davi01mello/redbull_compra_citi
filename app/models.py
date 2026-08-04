@@ -34,6 +34,13 @@ class PaymentProvider(StrEnum):
     MERCADOPAGO = "MERCADOPAGO"
 
 
+class ManualReviewReason(StrEnum):
+    AMOUNT_MISMATCH = "AMOUNT_MISMATCH"
+    MISSING_APPROVED_AT = "MISSING_APPROVED_AT"
+    LATE_PAYMENT_STOCK_CONFLICT = "LATE_PAYMENT_STOCK_CONFLICT"
+    RESERVATION_NOT_ACTIVE = "RESERVATION_NOT_ACTIVE"
+
+
 class Product(BaseModel):
     id: str
     name: str
@@ -104,4 +111,14 @@ class MercadoPagoWebhookPayload(BaseModel):
     type: str = Field(default="payment", max_length=120)
     action: str = Field(default="payment.updated", max_length=120)
     data: MercadoPagoWebhookData
+
+
+class ManualReview(BaseModel):
+    id: UUID
+    order_id: UUID
+    buyer_name: str
+    reason: ManualReviewReason
+    details: str | None
+    created_at: datetime
+    resolved_at: datetime | None
 

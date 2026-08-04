@@ -12,6 +12,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -87,6 +88,10 @@ class OrderORM(Base):
     payment: Mapped["PaymentORM | None"] = relationship(
         back_populates="order",
         uselist=False,
+        cascade="all, delete-orphan",
+    )
+    manual_reviews: Mapped[list["ManualReviewORM"]] = relationship(
+        back_populates="order",
         cascade="all, delete-orphan",
     )
 
@@ -206,3 +211,34 @@ class WebhookEventORM(Base):
     event_type: Mapped[str] = mapped_column(String(120), nullable=False)
     provider_payment_id: Mapped[str | None] = mapped_column(String(120))
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ManualReviewORM(Base):
+    __tablename__ = "manual_reviews"
+    __table_args__ = (
+        UniqueConstraint(
+            "order_id",
+            "reason",
+            name="uq_manual_reviews_order_id_reason",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        primary_key=True,
+    )
+    order_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    reason: Mapped[str] = mapped_column(String(50), nullable=False)
+    details: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    order: Mapped[OrderORM] = relationship(back_populates="manual_reviews")
