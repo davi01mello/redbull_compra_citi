@@ -53,6 +53,7 @@ TEST_DATABASE_URL = validate_test_database_url(
 # app.db.base continua lendo DATABASE_URL; somente o processo do Pytest recebe
 # a URL isolada antes de importar qualquer módulo da aplicação.
 os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+os.environ["PAYMENT_PROVIDER"] = "mock"
 
 
 @pytest.fixture(scope="session", autouse=True)

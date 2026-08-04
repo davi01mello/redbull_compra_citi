@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -5,6 +6,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .config import settings
 from .db.base import get_db
 from .models import (
     Order,
@@ -14,12 +16,24 @@ from .models import (
     Product,
     WebhookPayload,
 )
+from .payments import create_payment_provider
 from .store import store
 
 BASE_DIR = Path(__file__).resolve().parent
 WEBHOOK_TOKEN = "mvp-local-token"
 
-app = FastAPI(title="Red Bull PDV — MVP", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    payment_provider = create_payment_provider(settings)
+    app.state.payment_provider = payment_provider
+    try:
+        yield
+    finally:
+        await payment_provider.aclose()
+
+
+app = FastAPI(title="Red Bull PDV — MVP", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 
