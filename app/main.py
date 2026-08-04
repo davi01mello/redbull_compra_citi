@@ -38,6 +38,12 @@ async def create_order(
     return await store.create_order(db, payload)
 
 
+@app.post("/api/orders/{order_id}/cancel")
+async def cancel_order(order_id: str, db: AsyncSession = Depends(get_db)) -> dict:
+    order = await store.cancel_order(db, order_id)
+    return {"cancelled": True, "order_id": str(order.id), "status": order.status}
+
+
 @app.get("/api/orders/{order_id}", response_model=Order)
 async def get_order(order_id: str, db: AsyncSession = Depends(get_db)) -> Order:
     return await store.get_order(db, order_id)

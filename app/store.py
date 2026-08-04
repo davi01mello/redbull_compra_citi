@@ -3,8 +3,9 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import NO_VALUE
 from sqlalchemy.orm import selectinload
 
 from .db.models import OrderItemORM, OrderORM, ProductORM
@@ -31,18 +32,24 @@ def _product_to_model(product: ProductORM) -> Product:
 
 
 def _order_to_model(order: OrderORM) -> Order:
+    loaded_items = inspect(order).attrs["items"].loaded_value
+    items_source = (
+        loaded_items
+        if loaded_items is not NO_VALUE and loaded_items
+        else order.pending_items or []
+    )
     return Order(
         id=order.id,
         buyer_name=order.buyer_name,
         items=[
             OrderItem(
-                product_id=item.product_id,
-                product_name=item.product_name,
-                quantity=item.quantity,
-                unit_price=float(item.unit_price),
-                subtotal=float(item.subtotal),
+                product_id=item.product_id if hasattr(item, 'product_id') else item['product_id'],
+                product_name=item.product_name if hasattr(item, 'product_name') else item['product_name'],
+                quantity=item.quantity if hasattr(item, 'quantity') else item['quantity'],
+                unit_price=float(item.unit_price if hasattr(item, 'unit_price') else item['unit_price']),
+                subtotal=float(item.subtotal if hasattr(item, 'subtotal') else item['subtotal']),
             )
-            for item in order.items
+            for item in items_source
         ],
         total=float(order.total),
         status=order.status,
@@ -74,7 +81,7 @@ class DatabaseStore:
 
             total_quantity = sum(requested.values())
             unit_price = Decimal(str(unit_price_for_quantity(total_quantity)))
-            items: list[OrderItemORM] = []
+            pending_items: list[dict] = []
 
             for product_id, quantity in requested.items():
                 product = products.get(product_id)
@@ -83,23 +90,21 @@ class DatabaseStore:
                 if quantity > product.stock:
                     raise HTTPException(409, f"Estoque insuficiente para {product.name}")
 
-                items.append(
-                    OrderItemORM(
-                        product_id=product.id,
-                        product_name=product.name,
-                        quantity=quantity,
-                        unit_price=unit_price,
-                        subtotal=unit_price * quantity,
-                    )
-                )
+                pending_items.append({
+                    "product_id": product.id,
+                    "product_name": product.name,
+                    "quantity": quantity,
+                    "unit_price": float(unit_price),
+                    "subtotal": float(unit_price * quantity),
+                })
 
             order_id = uuid4()
             txid = f"SIM-{order_id.hex[:16].upper()}"
-            total = sum((item.subtotal for item in items), start=Decimal("0.00"))
+            total = sum(Decimal(str(item["subtotal"])) for item in pending_items)
             order = OrderORM(
                 id=order_id,
                 buyer_name=payload.buyer_name.strip(),
-                items=items,
+                pending_items=pending_items,
                 total=total,
                 status=OrderStatus.PENDING,
                 created_at=datetime.now(UTC),
@@ -142,8 +147,11 @@ class DatabaseStore:
             await db.refresh(order, attribute_names=["items"])
             if order.status == OrderStatus.PAID:
                 return _order_to_model(order), False
+            if order.status == OrderStatus.CANCELLED:
+                raise HTTPException(409, "Pedido cancelado não pode ser pago")
 
-            product_ids = sorted({item.product_id for item in order.items})
+            items_source = order.items if order.items else order.pending_items or []
+            product_ids = sorted({item.product_id if hasattr(item, 'product_id') else item['product_id'] for item in items_source})
             products_result = await db.execute(
                 select(ProductORM)
                 .where(ProductORM.id.in_(product_ids))
@@ -152,13 +160,30 @@ class DatabaseStore:
             )
             products = {product.id: product for product in products_result.scalars()}
 
-            for item in order.items:
-                if products[item.product_id].stock < item.quantity:
+            for item in items_source:
+                product_id = item.product_id if hasattr(item, 'product_id') else item['product_id']
+                quantity = item.quantity if hasattr(item, 'quantity') else item['quantity']
+                if products[product_id].stock < quantity:
                     raise HTTPException(
                         409, "Estoque insuficiente para concluir o pagamento"
                     )
-            for item in order.items:
-                products[item.product_id].stock -= item.quantity
+            for item in items_source:
+                product_id = item.product_id if hasattr(item, 'product_id') else item['product_id']
+                quantity = item.quantity if hasattr(item, 'quantity') else item['quantity']
+                products[product_id].stock -= quantity
+
+            if not order.items:
+                order.items = [
+                    OrderItemORM(
+                        order_id=order.id,
+                        product_id=item['product_id'],
+                        product_name=item['product_name'],
+                        quantity=item['quantity'],
+                        unit_price=Decimal(str(item['unit_price'])),
+                        subtotal=Decimal(str(item['subtotal'])),
+                    )
+                    for item in order.pending_items
+                ]
 
             order.status = OrderStatus.PAID
             order.paid_at = datetime.now(UTC)
@@ -166,6 +191,29 @@ class DatabaseStore:
             response = _order_to_model(order)
 
         return response, True
+
+    async def cancel_order(self, db: AsyncSession, order_id: str) -> Order:
+        try:
+            parsed_order_id = UUID(order_id)
+        except ValueError:
+            raise HTTPException(404, "Pedido não encontrado") from None
+
+        async with db.begin():
+            result = await db.execute(
+                select(OrderORM).where(OrderORM.id == parsed_order_id).with_for_update()
+            )
+            order = result.scalar_one_or_none()
+            if not order:
+                raise HTTPException(404, "Pedido não encontrado")
+
+            if order.status == OrderStatus.PAID:
+                raise HTTPException(409, "Não é possível cancelar um pedido já pago")
+            if order.status == OrderStatus.CANCELLED:
+                return _order_to_model(order)
+
+            order.status = OrderStatus.CANCELLED
+            await db.flush()
+            return _order_to_model(order)
 
 
 store = DatabaseStore()

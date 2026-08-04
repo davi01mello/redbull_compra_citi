@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, JSON, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -38,6 +38,7 @@ class OrderORM(Base):
     txid: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
     qr_code: Mapped[str] = mapped_column(Text, nullable=False)
     copy_paste: Mapped[str] = mapped_column(Text, nullable=False)
+    pending_items: Mapped[list[dict]] = mapped_column(JSON, nullable=False, default=list)
 
     items: Mapped[list["OrderItemORM"]] = relationship(
         back_populates="order",

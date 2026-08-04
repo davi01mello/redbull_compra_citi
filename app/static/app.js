@@ -148,6 +148,53 @@ function renderSuccess() {
   el('success-items').innerHTML = state.order.items.map(item => `${item.quantity}× ${escapeHtml(item.product_name.replace('Energy ', ''))}`).join('<br>');
 }
 
+function paymentStatusText(status) {
+  if (status === 'PAID') return 'Pagamento confirmado';
+  if (status === 'CANCELLED') return 'Pedido cancelado';
+  return 'Aguardando pagamento';
+}
+
+function renderPaymentStatus() {
+  if (!state.order) return;
+  const statusEl = el('payment-status');
+  const statusTextEl = el('payment-status-text');
+  if (statusTextEl) {
+    statusTextEl.textContent = paymentStatusText(state.order.status);
+  }
+  statusEl.classList.toggle('status-pending', state.order.status === 'PENDING');
+  statusEl.classList.toggle('status-paid', state.order.status === 'PAID');
+  statusEl.classList.toggle('status-cancelled', state.order.status === 'CANCELLED');
+}
+
+function updatePaymentControls() {
+  const isPending = state.order?.status === 'PENDING';
+  const isCancelled = state.order?.status === 'CANCELLED';
+  el('simulate-payment').disabled = !isPending;
+  el('copy-pix').disabled = isCancelled;
+  el('cancel-order').disabled = !isPending;
+}
+
+function setOrderViewState() {
+  renderPaymentStatus();
+  updatePaymentControls();
+}
+
+async function cancelOrder() {
+  if (!state.order || state.submitting || state.order.status !== 'PENDING') return;
+
+  setSubmitting(true);
+  try {
+    const response = await api(`/api/orders/${state.order.id}/cancel`, { method: 'POST' });
+    state.order.status = response.status;
+    setOrderViewState();
+    toast('Pedido cancelado com sucesso.');
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setSubmitting(false);
+  }
+}
+
 el('buyer-name').addEventListener('input', () => validateForm(false));
 el('buyer-name').addEventListener('blur', () => validName(true));
 
@@ -165,6 +212,7 @@ el('order-form').addEventListener('submit', async event => {
     el('pix-code').textContent = state.order.payment.copy_paste;
     el('payment-total').textContent = money(state.order.total);
     show('payment');
+    setOrderViewState();
   } catch (error) {
     toast(error.message);
     await loadProducts().catch(() => {});
@@ -182,6 +230,10 @@ el('copy-pix').addEventListener('click', async () => {
   } catch {
     toast('Não foi possível copiar. Selecione o código manualmente.');
   }
+});
+
+el('cancel-order').addEventListener('click', async () => {
+  await cancelOrder();
 });
 
 el('simulate-payment').addEventListener('click', async () => {

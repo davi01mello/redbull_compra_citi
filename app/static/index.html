@@ -76,15 +76,20 @@
         <strong id="payment-total">R$ 0,00</strong>
       </div>
 
-      <div class="status-pill" id="payment-status" role="status">
+      <div class="status-pill status-pending" id="payment-status" role="status">
         <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
-        Aguardando pagamento
+        <span id="payment-status-text">Aguardando pagamento</span>
       </div>
 
       <code id="pix-code" class="sr-only"></code>
       <button class="outline-button" id="copy-pix">
         <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="7" y="7" width="12" height="14" rx="2"/><path d="M15 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h2"/></svg>
         <span>Copiar código PIX</span>
+      </button>
+
+      <button class="outline-button cancel" id="cancel-order">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>
+        <span>Cancelar pedido</span>
       </button>
 
       <div class="demo-box">
