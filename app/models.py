@@ -10,6 +10,30 @@ class OrderStatus(StrEnum):
     PAID = "PAID"
 
 
+class PricingAudience(StrEnum):
+    MEMBER = "MEMBER"
+    NON_MEMBER = "NON_MEMBER"
+
+
+class ReservationStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    RELEASED = "RELEASED"
+    CONSUMED = "CONSUMED"
+
+
+class PaymentStatus(StrEnum):
+    CREATING = "CREATING"
+    WAITING_PAYMENT = "WAITING_PAYMENT"
+    APPROVED = "APPROVED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
+
+
+class PaymentProvider(StrEnum):
+    MOCK = "MOCK"
+    MERCADOPAGO = "MERCADOPAGO"
+
+
 class Product(BaseModel):
     id: str
     name: str
