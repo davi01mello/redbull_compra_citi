@@ -1,19 +1,39 @@
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import delete, update
 
+from app.db.base import AsyncSessionLocal, engine
+from app.db.models import OrderORM, ProductORM
 from app.main import app
-from app.store import MemoryStore
+
+
+INITIAL_STOCK = {"original": 24, "tropical": 18, "melancia": 16}
+
+
+async def reset_database():
+    async with AsyncSessionLocal() as session, session.begin():
+        await session.execute(delete(OrderORM))
+        for product_id, stock in INITIAL_STOCK.items():
+            await session.execute(
+                update(ProductORM)
+                .where(ProductORM.id == product_id)
+                .values(stock=stock)
+            )
+    await engine.dispose()
 
 
 @pytest.fixture()
-def client(monkeypatch):
-    fresh = MemoryStore()
-    monkeypatch.setattr("app.main.store", fresh)
-    return TestClient(app)
+def client():
+    asyncio.run(reset_database())
+    with TestClient(app) as test_client:
+        yield test_client
+    asyncio.run(engine.dispose())
 
 
 def test_health_and_products(client):
-    assert client.get("/api/health").json()["storage"] == "memory"
+    assert client.get("/api/health").json()["storage"] == "postgresql"
     assert len(client.get("/api/products").json()) == 3
 
 

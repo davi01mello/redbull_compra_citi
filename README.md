@@ -1,6 +1,6 @@
 # Red Bull PDV — MVP
 
-Esqueleto funcional do autoatendimento descritos em `AGENTS.md`. Nesta etapa, os dados vivem apenas na memória do processo e o pagamento PIX é simulado: nada é persistido e nenhuma cobrança real é criada.
+Esqueleto funcional do autoatendimento descrito em `AGENTS.md`. Produtos, pedidos e estoque são persistidos no PostgreSQL. O pagamento PIX ainda é simulado e nenhuma cobrança real é criada.
 
 ## Executar
 
@@ -8,6 +8,8 @@ Esqueleto funcional do autoatendimento descritos em `AGENTS.md`. Nesta etapa, os
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+docker compose up -d postgres
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
@@ -27,4 +29,4 @@ pytest
 
 ## Próximas integrações
 
-`MemoryStore` concentra o contrato temporário de persistência. Ele deve ser substituído por um repositório transacional conectado ao banco. As rotas `/api/mock/*` são exclusivas do MVP e deverão ser removidas quando um gateway PIX implementar a criação da cobrança e o webhook assinado.
+As rotas `/api/mock/*` são exclusivas do MVP e deverão ser removidas quando um gateway PIX implementar a criação da cobrança e o webhook assinado.
