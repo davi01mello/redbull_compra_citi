@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -7,13 +8,20 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from .db.models import OrderItemORM, OrderORM, PriceTierORM, ProductORM
+from .db.models import (
+    OrderItemORM,
+    OrderORM,
+    PaymentORM,
+    PriceTierORM,
+    ProductORM,
+)
 from .models import (
     Order,
     OrderCreate,
     OrderItem,
     OrderStatus,
     PaymentData,
+    PaymentStatus,
     PriceTier,
     PricingAudience,
     Product,
@@ -21,8 +29,10 @@ from .models import (
 )
 
 
-class ChargeCreationError(RuntimeError):
-    pass
+@dataclass(frozen=True)
+class ReservedOrder:
+    id: UUID
+    total: Decimal
 
 
 def _product_to_model(product: ProductORM) -> Product:
@@ -67,18 +77,6 @@ def _order_to_model(order: OrderORM) -> Order:
 
 
 class DatabaseStore:
-    async def _create_mock_charge(
-        self,
-        order_id: UUID,
-        total: Decimal,
-    ) -> PaymentData:
-        txid = f"SIM-{order_id.hex[:16].upper()}"
-        return PaymentData(
-            txid=txid,
-            qr_code=f"/api/mock/qr/{txid}",
-            copy_paste=f"00020126PIX-SIMULADO-{txid}-VALOR-{total:.2f}",
-        )
-
     async def list_products(self, db: AsyncSession) -> list[Product]:
         result = await db.execute(select(ProductORM).order_by(ProductORM.id))
         return [_product_to_model(product) for product in result.scalars()]
@@ -107,7 +105,11 @@ class DatabaseStore:
             for tier in result.scalars()
         ]
 
-    async def create_order(self, db: AsyncSession, payload: OrderCreate) -> Order:
+    async def reserve_order(
+        self,
+        db: AsyncSession,
+        payload: OrderCreate,
+    ) -> ReservedOrder:
         requested: dict[str, int] = {}
         for item in payload.items:
             requested[item.product_id] = requested.get(item.product_id, 0) + item.quantity
@@ -189,38 +191,37 @@ class DatabaseStore:
             db.add(order)
             await db.flush()
 
-        try:
-            payment = await self._create_mock_charge(order_id, total)
-        except ChargeCreationError as exc:
-            await self.release_reservation(db, order_id)
-            raise HTTPException(
-                502,
-                "Não foi possível criar a cobrança; a reserva foi liberada",
-            ) from exc
-
-        async with db.begin():
-            result = await db.execute(
-                select(OrderORM).where(OrderORM.id == order_id).with_for_update()
-            )
-            order = result.scalar_one()
-            order.txid = payment.txid
-            order.qr_code = payment.qr_code
-            order.copy_paste = payment.copy_paste
-            await db.flush()
-
-        return _order_to_model(order)
+        return ReservedOrder(id=order_id, total=total)
 
     async def release_reservation(
         self,
         db: AsyncSession,
         order_id: UUID,
+        payment_status: PaymentStatus | None = None,
     ) -> bool:
         async with db.begin():
             order_result = await db.execute(
                 select(OrderORM).where(OrderORM.id == order_id).with_for_update()
             )
             order = order_result.scalar_one_or_none()
+            payment = None
+            if payment_status is not None:
+                payment_result = await db.execute(
+                    select(PaymentORM)
+                    .where(PaymentORM.order_id == order_id)
+                    .with_for_update()
+                )
+                payment = payment_result.scalar_one_or_none()
+                if payment is not None and payment.status in {
+                    PaymentStatus.WAITING_PAYMENT,
+                    PaymentStatus.APPROVED,
+                }:
+                    return False
+
             if order is None or order.reservation_status != ReservationStatus.ACTIVE:
+                if payment is not None:
+                    payment.status = payment_status
+                    payment.updated_at = datetime.now(UTC)
                 return False
 
             items_result = await db.execute(
@@ -257,6 +258,9 @@ class DatabaseStore:
                 products[product_id].reserved_stock -= reserved_by_product[product_id]
 
             order.reservation_status = ReservationStatus.RELEASED
+            if payment is not None:
+                payment.status = payment_status
+                payment.updated_at = datetime.now(UTC)
             await db.flush()
 
         return True

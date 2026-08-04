@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,7 @@ from .models import (
     WebhookPayload,
 )
 from .payments import create_payment_provider
+from .payment_service import PaymentServiceError, create_order_with_payment
 from .store import store
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -62,9 +63,18 @@ async def price_tiers(
 
 @app.post("/api/orders", response_model=Order, status_code=201)
 async def create_order(
-    payload: OrderCreate, db: AsyncSession = Depends(get_db)
+    payload: OrderCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
 ) -> Order:
-    return await store.create_order(db, payload)
+    try:
+        return await create_order_with_payment(
+            db,
+            payload,
+            request.app.state.payment_provider,
+        )
+    except PaymentServiceError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 @app.get("/api/orders/{order_id}", response_model=Order)

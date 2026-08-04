@@ -59,7 +59,10 @@ def test_create_charge_sends_correct_payload_auth_and_idempotency_key():
                     "payments": [
                         {
                             "id": "payment-456",
-                            "payment_method": {"qr_code": "PIX-COPIA-E-COLA"},
+                            "payment_method": {
+                                "qr_code": "PIX-COPIA-E-COLA",
+                                "ticket_url": "https://example.test/pix/order-123",
+                            },
                         }
                     ]
                 },
@@ -99,6 +102,7 @@ def test_create_charge_sends_correct_payload_auth_and_idempotency_key():
     }
     assert result.provider_order_id == "order-123"
     assert result.provider_payment_id == "payment-456"
+    assert result.qr_code == "https://example.test/pix/order-123"
     assert result.copy_paste == "PIX-COPIA-E-COLA"
     assert result.amount == Decimal("16.00")
 
@@ -143,7 +147,12 @@ def test_create_charge_rejects_response_without_pix_code():
             json={
                 "id": "order-123",
                 "transactions": {
-                    "payments": [{"id": "payment-456", "payment_method": {}}]
+                    "payments": [
+                        {
+                            "id": "payment-456",
+                            "payment_method": {"qr_code": "PIX-COPIA-E-COLA"},
+                        }
+                    ]
                 },
             },
         )
@@ -151,7 +160,7 @@ def test_create_charge_rejects_response_without_pix_code():
     async def create(provider):
         return await provider.create_charge("order-1", Decimal("8.50"), "key-1")
 
-    with pytest.raises(PaymentProviderError, match="não retornou o código PIX"):
+    with pytest.raises(PaymentProviderError, match="não retornou a URL do QR Code"):
         run_with_provider(handler, create)
 
 

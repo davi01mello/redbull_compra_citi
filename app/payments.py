@@ -24,6 +24,7 @@ class PaymentProviderError(RuntimeError):
 class ChargeResult:
     provider_order_id: str
     provider_payment_id: str | None
+    qr_code: str
     copy_paste: str
     amount: Decimal
     expires_at: datetime
@@ -39,6 +40,8 @@ class PaymentResult:
 
 
 class PaymentProvider(Protocol):
+    provider_name: str
+
     async def create_charge(
         self,
         external_reference: str,
@@ -64,6 +67,8 @@ def _parse_datetime(value: object) -> datetime | None:
 
 
 class MockPaymentProvider:
+    provider_name = "mock"
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._payments: dict[str, PaymentResult] = {}
@@ -91,6 +96,7 @@ class MockPaymentProvider:
         return ChargeResult(
             provider_order_id=provider_order_id,
             provider_payment_id=provider_payment_id,
+            qr_code=f"/api/mock/qr/{provider_payment_id}",
             copy_paste=(
                 f"00020126PIX-SIMULADO-{external_reference}-VALOR-{amount:.2f}"
             ),
@@ -109,6 +115,8 @@ class MockPaymentProvider:
 
 
 class MercadoPagoProvider:
+    provider_name = "mercadopago"
+
     def __init__(
         self,
         settings: Settings,
@@ -250,17 +258,23 @@ class MercadoPagoProvider:
         if not isinstance(payment_method, dict):
             raise PaymentProviderError("O Mercado Pago retornou uma resposta inválida")
         copy_paste = payment_method.get("qr_code")
+        qr_code = payment_method.get("ticket_url")
         if not provider_order_id:
             raise PaymentProviderError(
                 "O Mercado Pago não retornou o identificador da cobrança"
             )
         if not copy_paste:
             raise PaymentProviderError("O Mercado Pago não retornou o código PIX")
+        if not qr_code:
+            raise PaymentProviderError(
+                "O Mercado Pago não retornou a URL do QR Code PIX"
+            )
         return ChargeResult(
             provider_order_id=str(provider_order_id),
             provider_payment_id=(
                 str(payment["id"]) if payment.get("id") is not None else None
             ),
+            qr_code=str(qr_code or ""),
             copy_paste=str(copy_paste),
             amount=amount,
             expires_at=(

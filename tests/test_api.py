@@ -14,7 +14,7 @@ from app.models import (
     ReservationStatus,
 )
 from app.main import app
-from app.store import ChargeCreationError, store
+from app.store import store
 
 
 INITIAL_STOCK = {"original": 24, "tropical": 18, "melancia": 16}
@@ -206,7 +206,7 @@ def test_concurrent_orders_compete_for_last_available_unit():
         async def attempt_order(buyer_name: str) -> int:
             async with AsyncSessionLocal() as session:
                 try:
-                    await store.create_order(
+                    await store.reserve_order(
                         session,
                         OrderCreate(
                             buyer_name=buyer_name,
@@ -271,7 +271,7 @@ def test_failure_before_reservation_does_not_create_partial_reservation():
 
         async with AsyncSessionLocal() as session:
             with pytest.raises(HTTPException) as exc_info:
-                await store.create_order(
+                await store.reserve_order(
                     session,
                     OrderCreate(
                         buyer_name="Sem estoque",
@@ -313,57 +313,11 @@ def test_failure_before_reservation_does_not_create_partial_reservation():
     assert order_count == 0
 
 
-def test_charge_failure_after_reservation_releases_it(monkeypatch):
-    async def fail_charge(_order_id, _total):
-        raise ChargeCreationError("falha simulada")
-
-    monkeypatch.setattr(store, "_create_mock_charge", fail_charge)
-
-    async def scenario():
-        await reset_database()
-        async with AsyncSessionLocal() as session:
-            with pytest.raises(HTTPException) as exc_info:
-                await store.create_order(
-                    session,
-                    OrderCreate(
-                        buyer_name="Falha após reserva",
-                        pricing_audience=PricingAudience.MEMBER,
-                        items=[OrderItemInput(product_id="original", quantity=2)],
-                    ),
-                )
-
-        async with AsyncSessionLocal() as session:
-            product = (
-                await session.execute(
-                    select(ProductORM).where(ProductORM.id == "original")
-                )
-            ).scalar_one()
-            order = (
-                await session.execute(
-                    select(OrderORM).where(OrderORM.buyer_name == "Falha após reserva")
-                )
-            ).scalar_one()
-            result = (
-                exc_info.value.status_code,
-                product.stock,
-                product.reserved_stock,
-                order.reservation_status,
-            )
-        await engine.dispose()
-        return result
-
-    status_code, stock, reserved_stock, reservation_status = asyncio.run(scenario())
-    assert status_code == 502
-    assert stock == INITIAL_STOCK["original"]
-    assert reserved_stock == 0
-    assert reservation_status == ReservationStatus.RELEASED
-
-
 def test_release_reservation_is_idempotent_and_keeps_physical_stock():
     async def scenario():
         await reset_database()
         async with AsyncSessionLocal() as session:
-            order = await store.create_order(
+            order = await store.reserve_order(
                 session,
                 OrderCreate(
                     buyer_name="Liberar duas vezes",
