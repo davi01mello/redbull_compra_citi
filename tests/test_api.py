@@ -1,13 +1,20 @@
 import asyncio
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, update
+from sqlalchemy import delete, select, update
 
 from app.db.base import AsyncSessionLocal, engine
 from app.db.models import OrderORM, PriceTierORM, ProductORM
-from app.models import PricingAudience
+from app.models import (
+    OrderCreate,
+    OrderItemInput,
+    PricingAudience,
+    ReservationStatus,
+)
 from app.main import app
+from app.store import ChargeCreationError, store
 
 
 INITIAL_STOCK = {"original": 24, "tropical": 18, "melancia": 16}
@@ -21,7 +28,7 @@ async def reset_database():
             await session.execute(
                 update(ProductORM)
                 .where(ProductORM.id == product_id)
-                .values(stock=stock)
+                .values(stock=stock, reserved_stock=0)
             )
     await engine.dispose()
 
@@ -43,6 +50,22 @@ def test_health_and_products(client):
     assert [tier["unit_price"] for tier in member_tiers] == [8.5, 8.0, 7.5]
 
 
+def test_product_listing_shows_stock_minus_active_reservations(client):
+    created = client.post(
+        "/api/orders",
+        json={
+            "buyer_name": "Reserva visível",
+            "pricing_audience": "MEMBER",
+            "items": [{"product_id": "original", "quantity": 2}],
+        },
+    )
+    assert created.status_code == 201
+
+    products = client.get("/api/products").json()
+    original = next(product for product in products if product["id"] == "original")
+    assert original["stock"] == INITIAL_STOCK["original"] - 2
+
+
 def test_order_payment_is_idempotent(client):
     created = client.post(
         "/api/orders",
@@ -58,8 +81,6 @@ def test_order_payment_is_idempotent(client):
     second = client.post(f"/api/mock/pay/{order['payment']['txid']}").json()
     assert first["processed"] is True
     assert second["processed"] is False
-    products = client.get("/api/products").json()
-    assert next(p for p in products if p["id"] == "original")["stock"] == 22
 
 
 @pytest.mark.parametrize(
@@ -170,6 +191,216 @@ def test_order_rejects_quantity_without_active_price_tier():
         )
     finally:
         asyncio.run(reset_database())
+
+
+def test_concurrent_orders_compete_for_last_available_unit():
+    async def scenario():
+        await reset_database()
+        async with AsyncSessionLocal() as session, session.begin():
+            await session.execute(
+                update(ProductORM)
+                .where(ProductORM.id == "original")
+                .values(stock=1, reserved_stock=0)
+            )
+
+        async def attempt_order(buyer_name: str) -> int:
+            async with AsyncSessionLocal() as session:
+                try:
+                    await store.create_order(
+                        session,
+                        OrderCreate(
+                            buyer_name=buyer_name,
+                            pricing_audience=PricingAudience.MEMBER,
+                            items=[OrderItemInput(product_id="original", quantity=1)],
+                        ),
+                    )
+                except HTTPException as exc:
+                    return exc.status_code
+                return 201
+
+        statuses = await asyncio.gather(
+            attempt_order("Concorrente A"),
+            attempt_order("Concorrente B"),
+        )
+
+        async with AsyncSessionLocal() as session:
+            product = (
+                await session.execute(
+                    select(ProductORM).where(ProductORM.id == "original")
+                )
+            ).scalar_one()
+            orders = list((await session.execute(select(OrderORM))).scalars())
+            listed_products = await store.list_products(session)
+            listed_original = next(
+                product for product in listed_products if product.id == "original"
+            )
+            result = (
+                statuses,
+                product.stock,
+                product.reserved_stock,
+                [order.reservation_status for order in orders],
+                listed_original.stock,
+            )
+        await engine.dispose()
+        return result
+
+    statuses, stock, reserved_stock, reservation_statuses, available_stock = (
+        asyncio.run(scenario())
+    )
+    assert sorted(statuses) == [201, 409]
+    assert stock == 1
+    assert reserved_stock == 1
+    assert reservation_statuses == [ReservationStatus.ACTIVE]
+    assert available_stock == 0
+
+
+def test_failure_before_reservation_does_not_create_partial_reservation():
+    async def scenario():
+        await reset_database()
+        async with AsyncSessionLocal() as session, session.begin():
+            await session.execute(
+                update(ProductORM)
+                .where(ProductORM.id == "original")
+                .values(stock=2, reserved_stock=0)
+            )
+            await session.execute(
+                update(ProductORM)
+                .where(ProductORM.id == "tropical")
+                .values(stock=0, reserved_stock=0)
+            )
+
+        async with AsyncSessionLocal() as session:
+            with pytest.raises(HTTPException) as exc_info:
+                await store.create_order(
+                    session,
+                    OrderCreate(
+                        buyer_name="Sem estoque",
+                        pricing_audience=PricingAudience.MEMBER,
+                        items=[
+                            OrderItemInput(product_id="original", quantity=1),
+                            OrderItemInput(product_id="tropical", quantity=1),
+                        ],
+                    ),
+                )
+
+        async with AsyncSessionLocal() as session:
+            products = list(
+                (
+                    await session.execute(
+                        select(ProductORM)
+                        .where(ProductORM.id.in_(["original", "tropical"]))
+                        .order_by(ProductORM.id)
+                    )
+                ).scalars()
+            )
+            order_count = len(
+                list((await session.execute(select(OrderORM))).scalars())
+            )
+            result = (
+                exc_info.value.status_code,
+                [
+                    (product.id, product.stock, product.reserved_stock)
+                    for product in products
+                ],
+                order_count,
+            )
+        await engine.dispose()
+        return result
+
+    status_code, inventory, order_count = asyncio.run(scenario())
+    assert status_code == 409
+    assert inventory == [("original", 2, 0), ("tropical", 0, 0)]
+    assert order_count == 0
+
+
+def test_charge_failure_after_reservation_releases_it(monkeypatch):
+    async def fail_charge(_order_id, _total):
+        raise ChargeCreationError("falha simulada")
+
+    monkeypatch.setattr(store, "_create_mock_charge", fail_charge)
+
+    async def scenario():
+        await reset_database()
+        async with AsyncSessionLocal() as session:
+            with pytest.raises(HTTPException) as exc_info:
+                await store.create_order(
+                    session,
+                    OrderCreate(
+                        buyer_name="Falha após reserva",
+                        pricing_audience=PricingAudience.MEMBER,
+                        items=[OrderItemInput(product_id="original", quantity=2)],
+                    ),
+                )
+
+        async with AsyncSessionLocal() as session:
+            product = (
+                await session.execute(
+                    select(ProductORM).where(ProductORM.id == "original")
+                )
+            ).scalar_one()
+            order = (
+                await session.execute(
+                    select(OrderORM).where(OrderORM.buyer_name == "Falha após reserva")
+                )
+            ).scalar_one()
+            result = (
+                exc_info.value.status_code,
+                product.stock,
+                product.reserved_stock,
+                order.reservation_status,
+            )
+        await engine.dispose()
+        return result
+
+    status_code, stock, reserved_stock, reservation_status = asyncio.run(scenario())
+    assert status_code == 502
+    assert stock == INITIAL_STOCK["original"]
+    assert reserved_stock == 0
+    assert reservation_status == ReservationStatus.RELEASED
+
+
+def test_release_reservation_is_idempotent_and_keeps_physical_stock():
+    async def scenario():
+        await reset_database()
+        async with AsyncSessionLocal() as session:
+            order = await store.create_order(
+                session,
+                OrderCreate(
+                    buyer_name="Liberar duas vezes",
+                    pricing_audience=PricingAudience.MEMBER,
+                    items=[OrderItemInput(product_id="original", quantity=2)],
+                ),
+            )
+            first_release = await store.release_reservation(session, order.id)
+            second_release = await store.release_reservation(session, order.id)
+
+        async with AsyncSessionLocal() as session:
+            product = (
+                await session.execute(
+                    select(ProductORM).where(ProductORM.id == "original")
+                )
+            ).scalar_one()
+            persisted_order = (
+                await session.execute(
+                    select(OrderORM).where(OrderORM.id == order.id)
+                )
+            ).scalar_one()
+            result = (
+                first_release,
+                second_release,
+                product.stock,
+                product.reserved_stock,
+                persisted_order.reservation_status,
+            )
+        await engine.dispose()
+        return result
+
+    first, second, stock, reserved_stock, reservation_status = asyncio.run(scenario())
+    assert first is True
+    assert second is False
+    assert stock == INITIAL_STOCK["original"]
+    assert reserved_stock == 0
+    assert reservation_status == ReservationStatus.RELEASED
 
 
 def test_webhook_rejects_invalid_token(client):

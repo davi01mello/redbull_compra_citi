@@ -17,7 +17,12 @@ from .models import (
     PriceTier,
     PricingAudience,
     Product,
+    ReservationStatus,
 )
+
+
+class ChargeCreationError(RuntimeError):
+    pass
 
 
 def _product_to_model(product: ProductORM) -> Product:
@@ -27,7 +32,7 @@ def _product_to_model(product: ProductORM) -> Product:
         description=product.description,
         color=product.color,
         price=float(product.price),
-        stock=product.stock,
+        stock=product.stock - product.reserved_stock,
     )
 
 
@@ -62,6 +67,18 @@ def _order_to_model(order: OrderORM) -> Order:
 
 
 class DatabaseStore:
+    async def _create_mock_charge(
+        self,
+        order_id: UUID,
+        total: Decimal,
+    ) -> PaymentData:
+        txid = f"SIM-{order_id.hex[:16].upper()}"
+        return PaymentData(
+            txid=txid,
+            qr_code=f"/api/mock/qr/{txid}",
+            copy_paste=f"00020126PIX-SIMULADO-{txid}-VALOR-{total:.2f}",
+        )
+
     async def list_products(self, db: AsyncSession) -> list[Product]:
         result = await db.execute(select(ProductORM).order_by(ProductORM.id))
         return [_product_to_model(product) for product in result.scalars()]
@@ -96,11 +113,6 @@ class DatabaseStore:
             requested[item.product_id] = requested.get(item.product_id, 0) + item.quantity
 
         async with db.begin():
-            result = await db.execute(
-                select(ProductORM).where(ProductORM.id.in_(requested))
-            )
-            products = {product.id: product for product in result.scalars()}
-
             total_quantity = sum(requested.values())
             tier_result = await db.execute(
                 select(PriceTierORM)
@@ -123,14 +135,25 @@ class DatabaseStore:
                     "Nenhuma faixa de preço ativa cobre este pedido",
                 )
 
+            product_ids = sorted(requested)
+            result = await db.execute(
+                select(ProductORM)
+                .where(ProductORM.id.in_(product_ids))
+                .order_by(ProductORM.id)
+                .with_for_update()
+            )
+            products = {product.id: product for product in result.scalars()}
+
             unit_price = Decimal(price_tier.unit_price)
             items: list[OrderItemORM] = []
 
-            for product_id, quantity in requested.items():
+            for product_id in product_ids:
+                quantity = requested[product_id]
                 product = products.get(product_id)
                 if not product:
                     raise HTTPException(404, f"Produto '{product_id}' não encontrado")
-                if quantity > product.stock:
+                available_stock = product.stock - product.reserved_stock
+                if quantity > available_stock:
                     raise HTTPException(409, f"Estoque insuficiente para {product.name}")
 
                 items.append(
@@ -143,8 +166,11 @@ class DatabaseStore:
                     )
                 )
 
+            for product_id in product_ids:
+                products[product_id].reserved_stock += requested[product_id]
+
             order_id = uuid4()
-            txid = f"SIM-{order_id.hex[:16].upper()}"
+            reservation_txid = f"RES-{order_id.hex.upper()}"
             total = sum((item.subtotal for item in items), start=Decimal("0.00"))
             order = OrderORM(
                 id=order_id,
@@ -153,16 +179,87 @@ class DatabaseStore:
                 total=total,
                 status=OrderStatus.PENDING,
                 created_at=datetime.now(UTC),
-                txid=txid,
-                qr_code=f"/api/mock/qr/{txid}",
-                copy_paste=f"00020126PIX-SIMULADO-{txid}-VALOR-{total:.2f}",
+                txid=reservation_txid,
+                qr_code="",
+                copy_paste="",
                 pricing_audience=payload.pricing_audience,
                 price_tier_id=price_tier.id,
+                reservation_status=ReservationStatus.ACTIVE,
             )
             db.add(order)
             await db.flush()
 
+        try:
+            payment = await self._create_mock_charge(order_id, total)
+        except ChargeCreationError as exc:
+            await self.release_reservation(db, order_id)
+            raise HTTPException(
+                502,
+                "Não foi possível criar a cobrança; a reserva foi liberada",
+            ) from exc
+
+        async with db.begin():
+            result = await db.execute(
+                select(OrderORM).where(OrderORM.id == order_id).with_for_update()
+            )
+            order = result.scalar_one()
+            order.txid = payment.txid
+            order.qr_code = payment.qr_code
+            order.copy_paste = payment.copy_paste
+            await db.flush()
+
         return _order_to_model(order)
+
+    async def release_reservation(
+        self,
+        db: AsyncSession,
+        order_id: UUID,
+    ) -> bool:
+        async with db.begin():
+            order_result = await db.execute(
+                select(OrderORM).where(OrderORM.id == order_id).with_for_update()
+            )
+            order = order_result.scalar_one_or_none()
+            if order is None or order.reservation_status != ReservationStatus.ACTIVE:
+                return False
+
+            items_result = await db.execute(
+                select(OrderItemORM)
+                .where(OrderItemORM.order_id == order_id)
+                .order_by(OrderItemORM.product_id)
+            )
+            reserved_by_product: dict[str, int] = {}
+            for item in items_result.scalars():
+                reserved_by_product[item.product_id] = (
+                    reserved_by_product.get(item.product_id, 0) + item.quantity
+                )
+
+            product_ids = sorted(reserved_by_product)
+            products_result = await db.execute(
+                select(ProductORM)
+                .where(ProductORM.id.in_(product_ids))
+                .order_by(ProductORM.id)
+                .with_for_update()
+            )
+            products = {
+                product.id: product for product in products_result.scalars()
+            }
+
+            for product_id in product_ids:
+                quantity = reserved_by_product[product_id]
+                product = products.get(product_id)
+                if product is None or product.reserved_stock < quantity:
+                    raise RuntimeError(
+                        f"Reserva inconsistente para o produto '{product_id}'"
+                    )
+
+            for product_id in product_ids:
+                products[product_id].reserved_stock -= reserved_by_product[product_id]
+
+            order.reservation_status = ReservationStatus.RELEASED
+            await db.flush()
+
+        return True
 
     async def get_order(self, db: AsyncSession, order_id: str) -> Order:
         try:
