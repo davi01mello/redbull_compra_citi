@@ -56,6 +56,7 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 h1 { margin: 0; font-size: clamp(34px, 10vw, 43px); line-height: 1.02; letter-spacing: -.045em; }
 h1 span { color: var(--green); }
 .intro > p:last-child, .payment-heading > p:last-child { max-width: 330px; margin: 13px 0 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
+.pricing-summary { margin: -13px 0 25px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 
 .name-field label { display: inline-block; margin: 0 0 9px 2px; font-size: 14px; font-weight: 700; }
 .input-wrap { position: relative; }

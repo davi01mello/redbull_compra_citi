@@ -50,6 +50,7 @@ class OrderItemInput(BaseModel):
 
 class OrderCreate(BaseModel):
     buyer_name: str = Field(min_length=2, max_length=80)
+    pricing_audience: PricingAudience
     items: list[OrderItemInput] = Field(min_length=1)
 
 
@@ -74,9 +75,19 @@ class Order(BaseModel):
     items: list[OrderItem]
     total: float
     status: OrderStatus
+    pricing_audience: PricingAudience
+    price_tier_id: int
     created_at: datetime
     paid_at: datetime | None = None
     payment: PaymentData
+
+
+class PriceTier(BaseModel):
+    id: int
+    pricing_audience: PricingAudience
+    min_quantity: int
+    max_quantity: int | None
+    unit_price: float
 
 
 class WebhookPayload(BaseModel):

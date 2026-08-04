@@ -6,7 +6,14 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db.base import get_db
-from .models import Order, OrderCreate, Product, WebhookPayload
+from .models import (
+    Order,
+    OrderCreate,
+    PriceTier,
+    PricingAudience,
+    Product,
+    WebhookPayload,
+)
 from .store import store
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,6 +36,14 @@ def health() -> dict:
 @app.get("/api/products", response_model=list[Product])
 async def products(db: AsyncSession = Depends(get_db)) -> list[Product]:
     return await store.list_products(db)
+
+
+@app.get("/api/price-tiers", response_model=list[PriceTier])
+async def price_tiers(
+    pricing_audience: PricingAudience,
+    db: AsyncSession = Depends(get_db),
+) -> list[PriceTier]:
+    return await store.list_price_tiers(db, pricing_audience)
 
 
 @app.post("/api/orders", response_model=Order, status_code=201)

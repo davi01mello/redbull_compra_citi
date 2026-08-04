@@ -3,20 +3,21 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from .db.models import OrderItemORM, OrderORM, ProductORM
-from .models import Order, OrderCreate, OrderItem, OrderStatus, PaymentData, Product
-
-
-def unit_price_for_quantity(quantity: int) -> float:
-    if quantity >= 4:
-        return 7.5
-    if quantity >= 2:
-        return 8.0
-    return 8.5
+from .db.models import OrderItemORM, OrderORM, PriceTierORM, ProductORM
+from .models import (
+    Order,
+    OrderCreate,
+    OrderItem,
+    OrderStatus,
+    PaymentData,
+    PriceTier,
+    PricingAudience,
+    Product,
+)
 
 
 def _product_to_model(product: ProductORM) -> Product:
@@ -31,6 +32,8 @@ def _product_to_model(product: ProductORM) -> Product:
 
 
 def _order_to_model(order: OrderORM) -> Order:
+    if order.price_tier_id is None:
+        raise RuntimeError(f"Pedido {order.id} não possui faixa de preço")
     return Order(
         id=order.id,
         buyer_name=order.buyer_name,
@@ -46,6 +49,8 @@ def _order_to_model(order: OrderORM) -> Order:
         ],
         total=float(order.total),
         status=order.status,
+        pricing_audience=order.pricing_audience,
+        price_tier_id=order.price_tier_id,
         created_at=order.created_at,
         paid_at=order.paid_at,
         payment=PaymentData(
@@ -61,6 +66,30 @@ class DatabaseStore:
         result = await db.execute(select(ProductORM).order_by(ProductORM.id))
         return [_product_to_model(product) for product in result.scalars()]
 
+    async def list_price_tiers(
+        self,
+        db: AsyncSession,
+        pricing_audience: PricingAudience,
+    ) -> list[PriceTier]:
+        result = await db.execute(
+            select(PriceTierORM)
+            .where(
+                PriceTierORM.pricing_audience == pricing_audience,
+                PriceTierORM.active.is_(True),
+            )
+            .order_by(PriceTierORM.min_quantity)
+        )
+        return [
+            PriceTier(
+                id=tier.id,
+                pricing_audience=tier.pricing_audience,
+                min_quantity=tier.min_quantity,
+                max_quantity=tier.max_quantity,
+                unit_price=float(tier.unit_price),
+            )
+            for tier in result.scalars()
+        ]
+
     async def create_order(self, db: AsyncSession, payload: OrderCreate) -> Order:
         requested: dict[str, int] = {}
         for item in payload.items:
@@ -73,7 +102,28 @@ class DatabaseStore:
             products = {product.id: product for product in result.scalars()}
 
             total_quantity = sum(requested.values())
-            unit_price = Decimal(str(unit_price_for_quantity(total_quantity)))
+            tier_result = await db.execute(
+                select(PriceTierORM)
+                .where(
+                    PriceTierORM.pricing_audience == payload.pricing_audience,
+                    PriceTierORM.active.is_(True),
+                    PriceTierORM.min_quantity <= total_quantity,
+                    or_(
+                        PriceTierORM.max_quantity.is_(None),
+                        PriceTierORM.max_quantity >= total_quantity,
+                    ),
+                )
+                .order_by(PriceTierORM.min_quantity.desc())
+                .limit(1)
+            )
+            price_tier = tier_result.scalar_one_or_none()
+            if price_tier is None:
+                raise HTTPException(
+                    422,
+                    "Nenhuma faixa de preço ativa cobre este pedido",
+                )
+
+            unit_price = Decimal(price_tier.unit_price)
             items: list[OrderItemORM] = []
 
             for product_id, quantity in requested.items():
@@ -106,6 +156,8 @@ class DatabaseStore:
                 txid=txid,
                 qr_code=f"/api/mock/qr/{txid}",
                 copy_paste=f"00020126PIX-SIMULADO-{txid}-VALOR-{total:.2f}",
+                pricing_audience=payload.pricing_audience,
+                price_tier_id=price_tier.id,
             )
             db.add(order)
             await db.flush()

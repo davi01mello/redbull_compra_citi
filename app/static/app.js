@@ -1,8 +1,17 @@
-const state = { products: [], cart: {}, order: null, loading: true, submitting: false };
+const pricingAudienceByUrl = { member: 'MEMBER', 'non-member': 'NON_MEMBER' };
+const pricingParam = new URLSearchParams(window.location.search).get('pricing');
+const state = {
+  products: [],
+  pricingTiers: [],
+  pricingAudience: pricingAudienceByUrl[pricingParam] || null,
+  cart: {},
+  order: null,
+  loading: true,
+  submitting: false
+};
 const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
 const el = id => document.getElementById(id);
 const escapeHtml = value => String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
-const unitPriceForQuantity = quantity => quantity >= 4 ? 7.5 : quantity >= 2 ? 8 : 8.5;
 
 let toastTimer;
 function toast(message) {
@@ -36,11 +45,41 @@ function productImage(product) {
   return images[product.id] || images.original;
 }
 
+function priceTierForQuantity(quantity) {
+  return state.pricingTiers.find(tier => (
+    quantity >= tier.min_quantity
+    && (tier.max_quantity === null || quantity <= tier.max_quantity)
+  ));
+}
+
+function tierQuantityLabel(tier) {
+  if (tier.max_quantity === null && tier.min_quantity === 1) return 'qualquer quantidade';
+  if (tier.max_quantity === null) return `${tier.min_quantity}+ unidades`;
+  if (tier.min_quantity === tier.max_quantity) return `${tier.min_quantity} unidade`;
+  return `${tier.min_quantity}–${tier.max_quantity} unidades`;
+}
+
+function renderPricingSummary() {
+  const audience = state.pricingAudience === 'MEMBER' ? 'Preço para membros' : 'Preço para não membros';
+  const tiers = state.pricingTiers.map(tier => `${tierQuantityLabel(tier)}: ${money(tier.unit_price)}`).join(' · ');
+  el('pricing-summary').textContent = `${audience} — ${tiers}`;
+}
+
 async function loadProducts() {
   state.loading = true;
   el('products').setAttribute('aria-busy', 'true');
   try {
-    state.products = await api('/api/products');
+    if (!state.pricingAudience) {
+      throw new Error('Link de compra inválido. Escaneie novamente o QR Code do ponto de venda.');
+    }
+    [state.products, state.pricingTiers] = await Promise.all([
+      api('/api/products'),
+      api(`/api/price-tiers?pricing_audience=${encodeURIComponent(state.pricingAudience)}`)
+    ]);
+    if (!state.pricingTiers.length) {
+      throw new Error('Não há uma faixa de preço disponível para este ponto de venda.');
+    }
+    renderPricingSummary();
     const order = { tropical: 0, melancia: 1, original: 2 };
     state.products.sort((a, b) => (order[a.id] ?? 99) - (order[b.id] ?? 99));
     const validIds = new Set(state.products.map(product => product.id));
@@ -61,6 +100,11 @@ function renderProducts() {
   }
 
   const available = state.products.filter(product => product.stock > 0).length;
+  const selectedCount = Object.values(state.cart).reduce((sum, quantity) => sum + quantity, 0);
+  const currentTier = priceTierForQuantity(selectedCount || 1);
+  const unitPriceLabel = currentTier
+    ? `${money(currentTier.unit_price)} por unidade`
+    : 'Preço indisponível';
   el('stock-note').textContent = `${available} ${available === 1 ? 'sabor disponível' : 'sabores disponíveis'}`;
   el('products').innerHTML = state.products.map(product => {
     const quantity = state.cart[product.id] || 0;
@@ -73,7 +117,7 @@ function renderProducts() {
         </div>
         <div class="product-copy">
           <h3>${safeName}</h3>
-          <p class="${soldOut ? 'stock-label' : ''}">${soldOut ? 'Esgotado' : money(product.price)}</p>
+          <p class="${soldOut ? 'stock-label' : ''}">${soldOut ? 'Esgotado' : unitPriceLabel}</p>
         </div>
         <div class="quantity" aria-label="Quantidade de ${safeName}">
           <button type="button" data-id="${escapeHtml(product.id)}" data-delta="-1" aria-label="Diminuir ${safeName}" ${quantity === 0 ? 'disabled' : ''}>−</button>
@@ -99,8 +143,9 @@ function changeQuantity(id, delta) {
 function cartDetails() {
   const entries = Object.entries(state.cart).filter(([, quantity]) => quantity > 0);
   const count = entries.reduce((sum, [, quantity]) => sum + quantity, 0);
-  const total = count * unitPriceForQuantity(count);
-  return { entries, count, total };
+  const tier = count ? priceTierForQuantity(count) : null;
+  const total = tier ? count * tier.unit_price : 0;
+  return { entries, count, total, tier };
 }
 
 function renderCart() {
@@ -122,8 +167,9 @@ function validName(showError = false) {
 }
 
 function validateForm(showNameError = false) {
-  const hasItems = cartDetails().count > 0;
-  el('checkout').disabled = state.loading || state.submitting || !hasItems || !validName(showNameError);
+  const cart = cartDetails();
+  const hasPricedItems = cart.count > 0 && Boolean(cart.tier);
+  el('checkout').disabled = state.loading || state.submitting || !hasPricedItems || !validName(showNameError);
 }
 
 function setSubmitting(value) {
@@ -159,7 +205,11 @@ el('order-form').addEventListener('submit', async event => {
     const items = cartDetails().entries.map(([product_id, quantity]) => ({ product_id, quantity }));
     state.order = await api('/api/orders', {
       method: 'POST',
-      body: JSON.stringify({ buyer_name: el('buyer-name').value.trim(), items })
+      body: JSON.stringify({
+        buyer_name: el('buyer-name').value.trim(),
+        pricing_audience: state.pricingAudience,
+        items
+      })
     });
     el('qr-code').src = state.order.payment.qr_code;
     el('pix-code').textContent = state.order.payment.copy_paste;
@@ -223,5 +273,6 @@ loadProducts().then(route).catch(error => {
   el('products').setAttribute('aria-busy', 'false');
   el('products').innerHTML = '<div class="product sold-out"><div class="product-copy"><h3>Não foi possível carregar</h3><p>Atualize a página para tentar novamente.</p></div></div>';
   el('stock-note').textContent = 'Erro ao carregar';
+  el('pricing-summary').textContent = 'Preço indisponível para este link.';
   toast(error.message);
 });
