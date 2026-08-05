@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class OrderStatus(StrEnum):
     PENDING = "PENDING"
     PAID = "PAID"
+    CANCELLED = "CANCELLED"
 
 
 class Product(BaseModel):

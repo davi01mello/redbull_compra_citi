@@ -3,17 +3,26 @@ import asyncio
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, update
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
-from app.db.base import AsyncSessionLocal, engine
+from app.db.base import DATABASE_URL, get_db
 from app.db.models import OrderORM, ProductORM
 from app.main import app
 
 
 INITIAL_STOCK = {"original": 24, "tropical": 18, "melancia": 16}
+test_engine = create_async_engine(DATABASE_URL, poolclass=NullPool)
+TestSession = async_sessionmaker(test_engine, expire_on_commit=False)
+
+
+async def get_test_db():
+    async with TestSession() as session:
+        yield session
 
 
 async def reset_database():
-    async with AsyncSessionLocal() as session, session.begin():
+    async with TestSession() as session, session.begin():
         await session.execute(delete(OrderORM))
         for product_id, stock in INITIAL_STOCK.items():
             await session.execute(
@@ -21,20 +30,25 @@ async def reset_database():
                 .where(ProductORM.id == product_id)
                 .values(stock=stock)
             )
-    await engine.dispose()
 
 
 @pytest.fixture()
 def client():
     asyncio.run(reset_database())
-    with TestClient(app) as test_client:
-        yield test_client
-    asyncio.run(engine.dispose())
+    app.dependency_overrides[get_db] = get_test_db
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
+        asyncio.run(reset_database())
 
 
 def test_health_and_products(client):
     assert client.get("/api/health").json()["storage"] == "postgresql"
-    assert len(client.get("/api/products").json()) == 3
+    products = client.get("/api/products").json()
+    assert len(products) == 3
+    assert all(product["price"] == 8.5 for product in products)
 
 
 def test_order_payment_is_idempotent(client):
@@ -86,3 +100,23 @@ def test_progressive_price_uses_total_quantity_across_flavors(client):
 def test_webhook_rejects_invalid_token(client):
     response = client.post("/api/webhooks/pix", json={"txid": "invalid"})
     assert response.status_code == 401
+
+
+def test_order_cancel_sets_cancelled_status(client):
+    created = client.post(
+        "/api/orders",
+        json={"buyer_name": "Felipe", "items": [{"product_id": "original", "quantity": 2}]},
+    )
+    assert created.status_code == 201
+    order = created.json()
+
+    cancel = client.post(f"/api/orders/{order['id']}/cancel")
+    assert cancel.status_code == 200
+    assert cancel.json()["status"] == "CANCELLED"
+
+    payment = client.post(f"/api/mock/pay/{order['payment']['txid']}")
+    assert payment.status_code == 409
+    assert payment.json()["detail"] == "Pedido cancelado não pode ser pago"
+
+    products = client.get("/api/products").json()
+    assert next(p for p in products if p["id"] == "original")["stock"] == INITIAL_STOCK["original"]
