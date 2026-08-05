@@ -23,7 +23,10 @@ Acesse `http://127.0.0.1:8000`. A documentação da API fica em `http://127.0.0.
 
 ## Testes
 
+Os testes usam exclusivamente `TEST_DATABASE_URL`. Essa URL deve apontar para um PostgreSQL cujo nome comece com `test` ou termine com `_test`, e não pode ser a mesma de `DATABASE_URL`.
+
 ```bash
+docker compose up -d postgres_test
 pytest
 ```
 

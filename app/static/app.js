@@ -1,8 +1,25 @@
-const state = { products: [], cart: {}, order: null, loading: true, submitting: false };
+const pricingAudienceByUrl = { member: 'MEMBER', 'non-member': 'NON_MEMBER' };
+const pricingParam = new URLSearchParams(window.location.search).get('pricing');
+const state = {
+  products: [],
+  pricingTiers: [],
+  pricingAudience: pricingAudienceByUrl[pricingParam] || null,
+  cart: {},
+  order: null,
+  loading: true,
+  submitting: false
+};
 const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
 const el = id => document.getElementById(id);
 const escapeHtml = value => String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
-const unitPriceForQuantity = quantity => quantity >= 4 ? 7.5 : quantity >= 2 ? 8 : 8.5;
+const PAYMENT_POLL_INTERVAL_MS = 2500;
+
+let paymentPollTimer = null;
+let paymentPollInFlight = false;
+let paymentPollSession = 0;
+let paymentCountdownTimer = null;
+let paymentCountdownExpiresAt = null;
+let paymentCancelling = false;
 
 let toastTimer;
 function toast(message) {
@@ -36,11 +53,41 @@ function productImage(product) {
   return images[product.id] || images.original;
 }
 
+function priceTierForQuantity(quantity) {
+  return state.pricingTiers.find(tier => (
+    quantity >= tier.min_quantity
+    && (tier.max_quantity === null || quantity <= tier.max_quantity)
+  ));
+}
+
+function tierQuantityLabel(tier) {
+  if (tier.max_quantity === null && tier.min_quantity === 1) return 'qualquer quantidade';
+  if (tier.max_quantity === null) return `${tier.min_quantity}+ unidades`;
+  if (tier.min_quantity === tier.max_quantity) return `${tier.min_quantity} unidade`;
+  return `${tier.min_quantity}–${tier.max_quantity} unidades`;
+}
+
+function renderPricingSummary() {
+  const audience = state.pricingAudience === 'MEMBER' ? 'Preço para membros' : 'Preço para não membros';
+  const tiers = state.pricingTiers.map(tier => `${tierQuantityLabel(tier)}: ${money(tier.unit_price)}`).join(' · ');
+  el('pricing-summary').textContent = `${audience} — ${tiers}`;
+}
+
 async function loadProducts() {
   state.loading = true;
   el('products').setAttribute('aria-busy', 'true');
   try {
-    state.products = await api('/api/products');
+    if (!state.pricingAudience) {
+      throw new Error('Link de compra inválido. Escaneie novamente o QR Code do ponto de venda.');
+    }
+    [state.products, state.pricingTiers] = await Promise.all([
+      api('/api/products'),
+      api(`/api/price-tiers?pricing_audience=${encodeURIComponent(state.pricingAudience)}`)
+    ]);
+    if (!state.pricingTiers.length) {
+      throw new Error('Não há uma faixa de preço disponível para este ponto de venda.');
+    }
+    renderPricingSummary();
     const order = { tropical: 0, melancia: 1, original: 2 };
     state.products.sort((a, b) => (order[a.id] ?? 99) - (order[b.id] ?? 99));
     const validIds = new Set(state.products.map(product => product.id));
@@ -61,8 +108,11 @@ function renderProducts() {
   }
 
   const available = state.products.filter(product => product.stock > 0).length;
-  const cartCount = cartDetails().count;
-  const currentUnitPrice = cartCount > 0 ? unitPriceForQuantity(cartCount) : null;
+  const selectedCount = Object.values(state.cart).reduce((sum, quantity) => sum + quantity, 0);
+  const currentTier = priceTierForQuantity(selectedCount || 1);
+  const unitPriceLabel = currentTier
+    ? `${money(currentTier.unit_price)} por unidade`
+    : 'Preço indisponível';
   el('stock-note').textContent = `${available} ${available === 1 ? 'sabor disponível' : 'sabores disponíveis'}`;
   el('products').innerHTML = state.products.map(product => {
     const quantity = state.cart[product.id] || 0;
@@ -75,7 +125,7 @@ function renderProducts() {
         </div>
         <div class="product-copy">
           <h3>${safeName}</h3>
-          <p class="${soldOut ? 'stock-label' : ''}">${soldOut ? 'Esgotado' : money(currentUnitPrice ?? product.price)}</p>
+          <p class="${soldOut ? 'stock-label' : ''}">${soldOut ? 'Esgotado' : unitPriceLabel}</p>
         </div>
         <div class="quantity" aria-label="Quantidade de ${safeName}">
           <button type="button" data-id="${escapeHtml(product.id)}" data-delta="-1" aria-label="Diminuir ${safeName}" ${quantity === 0 ? 'disabled' : ''}>−</button>
@@ -101,8 +151,9 @@ function changeQuantity(id, delta) {
 function cartDetails() {
   const entries = Object.entries(state.cart).filter(([, quantity]) => quantity > 0);
   const count = entries.reduce((sum, [, quantity]) => sum + quantity, 0);
-  const total = count * unitPriceForQuantity(count);
-  return { entries, count, total };
+  const tier = count ? priceTierForQuantity(count) : null;
+  const total = tier ? count * tier.unit_price : 0;
+  return { entries, count, total, tier };
 }
 
 function renderCart() {
@@ -124,8 +175,9 @@ function validName(showError = false) {
 }
 
 function validateForm(showNameError = false) {
-  const hasItems = cartDetails().count > 0;
-  el('checkout').disabled = state.loading || state.submitting || !hasItems || !validName(showNameError);
+  const cart = cartDetails();
+  const hasPricedItems = cart.count > 0 && Boolean(cart.tier);
+  el('checkout').disabled = state.loading || state.submitting || !hasPricedItems || !validName(showNameError);
 }
 
 function setSubmitting(value) {
@@ -150,51 +202,166 @@ function renderSuccess() {
   el('success-items').innerHTML = state.order.items.map(item => `${item.quantity}× ${escapeHtml(item.product_name.replace('Energy ', ''))}`).join('<br>');
 }
 
-function paymentStatusText(status) {
-  if (status === 'PAID') return 'Pagamento confirmado';
-  if (status === 'CANCELLED') return 'Pedido cancelado';
-  return 'Aguardando pagamento';
-}
-
-function renderPaymentStatus() {
-  if (!state.order) return;
-  const statusEl = el('payment-status');
-  const statusTextEl = el('payment-status-text');
-  if (statusTextEl) {
-    statusTextEl.textContent = paymentStatusText(state.order.status);
+function stopPaymentPolling() {
+  paymentPollSession += 1;
+  if (paymentPollTimer !== null) {
+    clearInterval(paymentPollTimer);
+    paymentPollTimer = null;
   }
-  statusEl.classList.toggle('status-pending', state.order.status === 'PENDING');
-  statusEl.classList.toggle('status-paid', state.order.status === 'PAID');
-  statusEl.classList.toggle('status-cancelled', state.order.status === 'CANCELLED');
+  stopPaymentCountdown();
 }
 
-function updatePaymentControls() {
-  const isPending = state.order?.status === 'PENDING';
-  const isCancelled = state.order?.status === 'CANCELLED';
-  el('simulate-payment').disabled = !isPending;
-  el('copy-pix').disabled = isCancelled;
-  el('cancel-order').disabled = !isPending;
+function stopPaymentCountdown() {
+  if (paymentCountdownTimer !== null) {
+    clearInterval(paymentCountdownTimer);
+    paymentCountdownTimer = null;
+  }
+  paymentCountdownExpiresAt = null;
 }
 
-function setOrderViewState() {
-  renderPaymentStatus();
-  updatePaymentControls();
+function paymentExpirationMessage(expiresAt) {
+  if (!expiresAt) return '';
+  const expiration = new Date(expiresAt);
+  if (Number.isNaN(expiration.getTime())) return '';
+  const formatted = new Intl.DateTimeFormat('pt-BR', {
+    dateStyle: 'short',
+    timeStyle: 'short'
+  }).format(expiration);
+  return `Este PIX pode ser pago até ${formatted}.`;
 }
 
-async function cancelOrder() {
-  if (!state.order || state.submitting || state.order.status !== 'PENDING') return;
+function updatePaymentCountdown() {
+  if (!paymentCountdownExpiresAt) return;
+  const remainingSeconds = Math.max(
+    0,
+    Math.ceil((paymentCountdownExpiresAt.getTime() - Date.now()) / 1000)
+  );
+  const minutes = String(Math.floor(remainingSeconds / 60)).padStart(2, '0');
+  const seconds = String(remainingSeconds % 60).padStart(2, '0');
+  el('payment-status-label').textContent = remainingSeconds > 0
+    ? `Aguardando pagamento · ${minutes}:${seconds}`
+    : 'Prazo encerrado · finalizando...';
+  if (remainingSeconds === 0) refreshPaymentStatus();
+}
 
-  setSubmitting(true);
+function startPaymentCountdown(expiresAt) {
+  if (!expiresAt) {
+    stopPaymentCountdown();
+    return;
+  }
+  const expiration = new Date(expiresAt);
+  if (Number.isNaN(expiration.getTime())) {
+    stopPaymentCountdown();
+    return;
+  }
+  if (
+    paymentCountdownTimer !== null
+    && paymentCountdownExpiresAt?.getTime() === expiration.getTime()
+  ) {
+    updatePaymentCountdown();
+    return;
+  }
+  stopPaymentCountdown();
+  paymentCountdownExpiresAt = expiration;
+  updatePaymentCountdown();
+  paymentCountdownTimer = setInterval(updatePaymentCountdown, 1000);
+}
+
+function setPaymentDisplay(variant, label, message = '') {
+  const status = el('payment-status');
+  status.classList.remove('expired', 'failed', 'cancelled');
+  if (variant !== 'waiting') status.classList.add(variant);
+  el('payment-status-label').textContent = label;
+
+  const paymentMessage = el('payment-message');
+  paymentMessage.textContent = message;
+  paymentMessage.classList.toggle('hidden', !message);
+
+  const terminal = ['expired', 'failed', 'cancelled'].includes(variant);
+  el('copy-pix').disabled = terminal;
+  el('cancel-payment').classList.toggle('hidden', terminal);
+}
+
+function applyOrderPaymentStatus(order) {
+  state.order = order;
+
+  if (order.status === 'PAID' || order.payment.status === 'APPROVED') {
+    stopPaymentPolling();
+    renderSuccess();
+    show('success');
+    return true;
+  }
+
+  if (order.payment.status === 'EXPIRED') {
+    stopPaymentPolling();
+    setPaymentDisplay(
+      'expired',
+      'Prazo do PIX encerrado',
+      'Este pedido ficou pendente. Procure o time de Gente & Gestão para regularizar.'
+    );
+    return true;
+  }
+
+  if (order.payment.status === 'FAILED') {
+    stopPaymentPolling();
+    setPaymentDisplay(
+      'failed',
+      'Pagamento não gerado',
+      'A reserva foi liberada. Volte e faça um novo pedido.'
+    );
+    return true;
+  }
+
+  if (order.status === 'CANCELLED' || order.payment.status === 'CANCELLED') {
+    stopPaymentPolling();
+    setPaymentDisplay(
+      'cancelled',
+      'Pagamento cancelado',
+      'A cobrança foi interrompida e os produtos voltaram a ficar disponíveis.'
+    );
+    return true;
+  }
+
+  setPaymentDisplay(
+    'waiting',
+    'Aguardando pagamento',
+    paymentExpirationMessage(order.payment.expires_at)
+  );
+  startPaymentCountdown(order.payment.expires_at);
+  return false;
+}
+
+async function refreshPaymentStatus(session = paymentPollSession) {
+  if (!state.order || paymentPollInFlight) return;
+  const orderId = state.order.id;
+  paymentPollInFlight = true;
   try {
-    const response = await api(`/api/orders/${state.order.id}/cancel`, { method: 'POST' });
-    state.order.status = response.status;
-    setOrderViewState();
-    toast('Pedido cancelado com sucesso.');
-  } catch (error) {
-    toast(error.message);
+    const order = await api(`/api/orders/${encodeURIComponent(orderId)}`);
+    if (state.order?.id === orderId && session === paymentPollSession) {
+      applyOrderPaymentStatus(order);
+    }
+  } catch {
+    if (state.order?.id === orderId && session === paymentPollSession) {
+      setPaymentDisplay(
+        'waiting',
+        'Verificando pagamento',
+        'A confirmação está demorando. Esta página continuará tentando.'
+      );
+    }
   } finally {
-    setSubmitting(false);
+    paymentPollInFlight = false;
   }
+}
+
+function startPaymentPolling() {
+  stopPaymentPolling();
+  if (!state.order || applyOrderPaymentStatus(state.order)) return;
+  const session = paymentPollSession;
+  paymentPollTimer = setInterval(
+    () => refreshPaymentStatus(session),
+    PAYMENT_POLL_INTERVAL_MS
+  );
+  refreshPaymentStatus(session);
 }
 
 el('buyer-name').addEventListener('input', () => validateForm(false));
@@ -208,13 +375,18 @@ el('order-form').addEventListener('submit', async event => {
     const items = cartDetails().entries.map(([product_id, quantity]) => ({ product_id, quantity }));
     state.order = await api('/api/orders', {
       method: 'POST',
-      body: JSON.stringify({ buyer_name: el('buyer-name').value.trim(), items })
+      body: JSON.stringify({
+        buyer_name: el('buyer-name').value.trim(),
+        pricing_audience: state.pricingAudience,
+        items
+      })
     });
     el('qr-code').src = state.order.payment.qr_code;
     el('pix-code').textContent = state.order.payment.copy_paste;
     el('payment-total').textContent = money(state.order.total);
+    el('simulate-payment').classList.toggle('hidden', !state.order.payment.simulated);
     show('payment');
-    setOrderViewState();
+    startPaymentPolling();
   } catch (error) {
     toast(error.message);
     await loadProducts().catch(() => {});
@@ -222,7 +394,6 @@ el('order-form').addEventListener('submit', async event => {
     setSubmitting(false);
   }
 });
-
 el('copy-pix').addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(el('pix-code').textContent);
@@ -234,10 +405,6 @@ el('copy-pix').addEventListener('click', async () => {
   }
 });
 
-el('cancel-order').addEventListener('click', async () => {
-  await cancelOrder();
-});
-
 el('simulate-payment').addEventListener('click', async () => {
   if (!state.order) return;
   const button = el('simulate-payment');
@@ -245,8 +412,7 @@ el('simulate-payment').addEventListener('click', async () => {
     button.disabled = true;
     button.textContent = 'Confirmando...';
     await api(`/api/mock/pay/${state.order.payment.txid}`, { method: 'POST' });
-    renderSuccess();
-    show('success');
+    await refreshPaymentStatus();
   } catch (error) {
     toast(error.message);
     button.disabled = false;
@@ -254,8 +420,43 @@ el('simulate-payment').addEventListener('click', async () => {
   }
 });
 
-el('back-shop').addEventListener('click', () => show('shop'));
+async function cancelCurrentPayment() {
+  if (!state.order || paymentCancelling) return;
+  const confirmed = window.confirm(
+    'Deseja cancelar este pagamento? A cobrança será interrompida e a reserva será liberada.'
+  );
+  if (!confirmed) return;
+
+  paymentCancelling = true;
+  const button = el('cancel-payment');
+  button.disabled = true;
+  button.textContent = 'Cancelando...';
+  try {
+    state.order = await api(
+      `/api/orders/${encodeURIComponent(state.order.id)}/cancel`,
+      { method: 'POST' }
+    );
+    stopPaymentPolling();
+    state.cart = {};
+    state.order = null;
+    el('order-form').reset();
+    show('shop');
+    toast('Pagamento cancelado e estoque liberado.');
+    await loadProducts().catch(error => toast(error.message));
+  } catch (error) {
+    toast(error.message);
+    await refreshPaymentStatus();
+  } finally {
+    paymentCancelling = false;
+    button.disabled = false;
+    button.textContent = 'Cancelar pagamento';
+  }
+}
+
+el('cancel-payment').addEventListener('click', cancelCurrentPayment);
+el('back-shop').addEventListener('click', cancelCurrentPayment);
 el('new-order').addEventListener('click', async () => {
+  stopPaymentPolling();
   state.cart = {};
   state.order = null;
   el('order-form').reset();
@@ -277,5 +478,6 @@ loadProducts().then(route).catch(error => {
   el('products').setAttribute('aria-busy', 'false');
   el('products').innerHTML = '<div class="product sold-out"><div class="product-copy"><h3>Não foi possível carregar</h3><p>Atualize a página para tentar novamente.</p></div></div>';
   el('stock-note').textContent = 'Erro ao carregar';
+  el('pricing-summary').textContent = 'Preço indisponível para este link.';
   toast(error.message);
 });

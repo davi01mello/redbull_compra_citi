@@ -62,7 +62,11 @@ def downgrade() -> None:
     """Downgrade schema."""
     op.execute(
         sa.text(
-            "DELETE FROM products "
-            "WHERE id IN ('original', 'tropical', 'melancia')"
+            "DELETE FROM products AS product "
+            "WHERE product.id IN ('original', 'tropical', 'melancia') "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM order_items AS item "
+            "WHERE item.product_id = product.id"
+            ")"
         )
     )
