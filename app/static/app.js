@@ -61,6 +61,8 @@ function renderProducts() {
   }
 
   const available = state.products.filter(product => product.stock > 0).length;
+  const cartCount = cartDetails().count;
+  const currentUnitPrice = cartCount > 0 ? unitPriceForQuantity(cartCount) : null;
   el('stock-note').textContent = `${available} ${available === 1 ? 'sabor disponível' : 'sabores disponíveis'}`;
   el('products').innerHTML = state.products.map(product => {
     const quantity = state.cart[product.id] || 0;
@@ -73,7 +75,7 @@ function renderProducts() {
         </div>
         <div class="product-copy">
           <h3>${safeName}</h3>
-          <p class="${soldOut ? 'stock-label' : ''}">${soldOut ? 'Esgotado' : money(product.price)}</p>
+          <p class="${soldOut ? 'stock-label' : ''}">${soldOut ? 'Esgotado' : money(currentUnitPrice ?? product.price)}</p>
         </div>
         <div class="quantity" aria-label="Quantidade de ${safeName}">
           <button type="button" data-id="${escapeHtml(product.id)}" data-delta="-1" aria-label="Diminuir ${safeName}" ${quantity === 0 ? 'disabled' : ''}>−</button>
