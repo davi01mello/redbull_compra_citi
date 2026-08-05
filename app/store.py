@@ -21,6 +21,7 @@ from .models import (
     OrderItem,
     OrderStatus,
     PaymentData,
+    PaymentProvider,
     PaymentStatus,
     PriceTier,
     PricingAudience,
@@ -49,6 +50,16 @@ def _product_to_model(product: ProductORM) -> Product:
 def _order_to_model(order: OrderORM) -> Order:
     if order.price_tier_id is None:
         raise RuntimeError(f"Pedido {order.id} não possui faixa de preço")
+    payment = order.payment
+    if payment is None:
+        raise RuntimeError(f"Pedido {order.id} não possui pagamento")
+    payment_reference = payment.provider_payment_id or payment.provider_order_id
+    if (
+        not payment_reference
+        or payment.copy_paste is None
+        or payment.qr_code is None
+    ):
+        raise RuntimeError(f"Pagamento do pedido {order.id} está incompleto")
     return Order(
         id=order.id,
         buyer_name=order.buyer_name,
@@ -69,9 +80,10 @@ def _order_to_model(order: OrderORM) -> Order:
         created_at=order.created_at,
         paid_at=order.paid_at,
         payment=PaymentData(
-            txid=order.txid,
-            qr_code=order.qr_code,
-            copy_paste=order.copy_paste,
+            txid=payment_reference,
+            qr_code=payment.qr_code,
+            copy_paste=payment.copy_paste,
+            simulated=payment.provider == PaymentProvider.MOCK,
         ),
     )
 
@@ -172,7 +184,6 @@ class DatabaseStore:
                 products[product_id].reserved_stock += requested[product_id]
 
             order_id = uuid4()
-            reservation_txid = f"RES-{order_id.hex.upper()}"
             total = sum((item.subtotal for item in items), start=Decimal("0.00"))
             order = OrderORM(
                 id=order_id,
@@ -181,9 +192,6 @@ class DatabaseStore:
                 total=total,
                 status=OrderStatus.PENDING,
                 created_at=datetime.now(UTC),
-                txid=reservation_txid,
-                qr_code="",
-                copy_paste="",
                 pricing_audience=payload.pricing_audience,
                 price_tier_id=price_tier.id,
                 reservation_status=ReservationStatus.ACTIVE,
@@ -273,8 +281,12 @@ class DatabaseStore:
 
         result = await db.execute(
             select(OrderORM)
-            .options(selectinload(OrderORM.items))
+            .options(
+                selectinload(OrderORM.items),
+                selectinload(OrderORM.payment),
+            )
             .where(OrderORM.id == parsed_order_id)
+            .execution_options(populate_existing=True)
         )
         order = result.scalar_one_or_none()
         if not order:
@@ -285,18 +297,51 @@ class DatabaseStore:
         self, db: AsyncSession, txid: str
     ) -> tuple[Order, bool]:
         async with db.begin():
+            payment_reference = (
+                await db.execute(
+                    select(PaymentORM.order_id).where(
+                        or_(
+                            PaymentORM.provider_payment_id == txid,
+                            PaymentORM.provider_order_id == txid,
+                        )
+                    )
+                )
+            ).scalar_one_or_none()
+            if payment_reference is None:
+                raise HTTPException(404, "Transação não encontrada")
+
             result = await db.execute(
-                select(OrderORM).where(OrderORM.txid == txid).with_for_update()
+                select(OrderORM)
+                .options(
+                    selectinload(OrderORM.items),
+                    selectinload(OrderORM.payment),
+                )
+                .where(OrderORM.id == payment_reference)
+                .with_for_update()
             )
             order = result.scalar_one_or_none()
             if not order:
                 raise HTTPException(404, "Transação não encontrada")
 
-            await db.refresh(order, attribute_names=["items"])
+            payment = (
+                await db.execute(
+                    select(PaymentORM)
+                    .where(PaymentORM.order_id == order.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one()
             if order.status == OrderStatus.PAID:
                 return _order_to_model(order), False
+            if order.reservation_status != ReservationStatus.ACTIVE:
+                raise HTTPException(409, "A reserva do pedido não está ativa")
 
-            product_ids = sorted({item.product_id for item in order.items})
+            quantities: dict[str, int] = {}
+            for item in order.items:
+                quantities[item.product_id] = (
+                    quantities.get(item.product_id, 0) + item.quantity
+                )
+            product_ids = sorted(quantities)
             products_result = await db.execute(
                 select(ProductORM)
                 .where(ProductORM.id.in_(product_ids))
@@ -305,16 +350,29 @@ class DatabaseStore:
             )
             products = {product.id: product for product in products_result.scalars()}
 
-            for item in order.items:
-                if products[item.product_id].stock < item.quantity:
+            for product_id in product_ids:
+                product = products.get(product_id)
+                quantity = quantities[product_id]
+                if (
+                    product is None
+                    or product.stock < quantity
+                    or product.reserved_stock < quantity
+                ):
                     raise HTTPException(
                         409, "Estoque insuficiente para concluir o pagamento"
                     )
-            for item in order.items:
-                products[item.product_id].stock -= item.quantity
+            for product_id in product_ids:
+                quantity = quantities[product_id]
+                products[product_id].stock -= quantity
+                products[product_id].reserved_stock -= quantity
 
+            paid_at = datetime.now(UTC)
+            payment.status = PaymentStatus.APPROVED
+            payment.approved_at = paid_at
+            payment.updated_at = paid_at
             order.status = OrderStatus.PAID
-            order.paid_at = datetime.now(UTC)
+            order.paid_at = paid_at
+            order.reservation_status = ReservationStatus.CONSUMED
             await db.flush()
             response = _order_to_model(order)
 

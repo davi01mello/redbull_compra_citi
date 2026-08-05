@@ -60,9 +60,6 @@ class OrderORM(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    txid: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
-    qr_code: Mapped[str] = mapped_column(Text, nullable=False)
-    copy_paste: Mapped[str] = mapped_column(Text, nullable=False)
     pricing_audience: Mapped[PricingAudience] = mapped_column(
         Enum(PricingAudience, name="pricing_audience"),
         nullable=False,
@@ -89,6 +86,7 @@ class OrderORM(Base):
         back_populates="order",
         uselist=False,
         cascade="all, delete-orphan",
+        lazy="selectin",
     )
     manual_reviews: Mapped[list["ManualReviewORM"]] = relationship(
         back_populates="order",
@@ -184,6 +182,7 @@ class PaymentORM(Base):
         server_default="BRL",
     )
     copy_paste: Mapped[str | None] = mapped_column(Text)
+    qr_code: Mapped[str | None] = mapped_column(Text)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

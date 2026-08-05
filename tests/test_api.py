@@ -357,6 +357,6 @@ def test_release_reservation_is_idempotent_and_keeps_physical_stock():
     assert reservation_status == ReservationStatus.RELEASED
 
 
-def test_webhook_rejects_invalid_token(client):
+def test_legacy_pix_webhook_was_removed(client):
     response = client.post("/api/webhooks/pix", json={"txid": "invalid"})
-    assert response.status_code == 401
+    assert response.status_code == 404

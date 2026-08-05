@@ -214,6 +214,7 @@ el('order-form').addEventListener('submit', async event => {
     el('qr-code').src = state.order.payment.qr_code;
     el('pix-code').textContent = state.order.payment.copy_paste;
     el('payment-total').textContent = money(state.order.total);
+    el('simulate-payment').classList.toggle('hidden', !state.order.payment.simulated);
     show('payment');
   } catch (error) {
     toast(error.message);

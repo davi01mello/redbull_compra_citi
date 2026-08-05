@@ -131,6 +131,7 @@ def test_order_orchestration_happy_path_commits_reservation_before_provider():
     assert payment.provider_order_id == f"provider-order-{order.id}"
     assert payment.provider_payment_id == f"provider-payment-{order.id}"
     assert payment.copy_paste == f"PIX-{order.id}"
+    assert payment.qr_code == f"https://example.test/pix/{order.id}"
     assert payment.amount == Decimal("16.00")
     assert product.stock == INITIAL_STOCK["original"]
     assert product.reserved_stock == 2

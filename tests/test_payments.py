@@ -193,6 +193,15 @@ def test_factory_only_accepts_mock_and_mercadopago():
     assert isinstance(create_payment_provider(mock_settings), MockPaymentProvider)
 
 
+def test_factory_does_not_fallback_to_mock_when_provider_is_missing(monkeypatch):
+    monkeypatch.delenv("PAYMENT_PROVIDER", raising=False)
+    settings = Settings.from_env()
+
+    assert settings.payment_provider == ""
+    with pytest.raises(RuntimeError, match="PAYMENT_PROVIDER"):
+        create_payment_provider(settings)
+
+
 def test_get_payment_queries_by_payment_id():
     captured = {}
 

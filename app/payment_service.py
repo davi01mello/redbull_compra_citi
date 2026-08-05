@@ -164,12 +164,9 @@ async def _save_charge(
         payment.amount = charge.amount
         payment.currency = "BRL"
         payment.copy_paste = charge.copy_paste
+        payment.qr_code = charge.qr_code
         payment.expires_at = charge.expires_at
         payment.updated_at = now
-
-        order.txid = charge.provider_payment_id or charge.provider_order_id
-        order.qr_code = charge.qr_code
-        order.copy_paste = charge.copy_paste
         await db.flush()
 
 

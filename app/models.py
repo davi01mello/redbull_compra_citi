@@ -97,11 +97,6 @@ class PriceTier(BaseModel):
     unit_price: float
 
 
-class WebhookPayload(BaseModel):
-    txid: str
-    event: str = "PIX_PAID"
-
-
 class MercadoPagoWebhookData(BaseModel):
     id: str | int
 

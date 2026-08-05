@@ -38,7 +38,7 @@ class Settings:
             mercadopago_webhook_secret=os.getenv(
                 "MERCADOPAGO_WEBHOOK_SECRET", ""
             ).strip(),
-            payment_provider=os.getenv("PAYMENT_PROVIDER", "mock").strip().lower(),
+            payment_provider=os.getenv("PAYMENT_PROVIDER", "").strip().lower(),
             charge_expires_in=charge_expires_in,
             payment_expiration_check_interval=payment_expiration_check_interval,
         )
