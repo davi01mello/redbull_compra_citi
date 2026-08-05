@@ -83,7 +83,7 @@ class RecordingProvider:
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
         )
 
-    async def get_payment(self, _payment_id):
+    async def get_order(self, _order_id):
         raise NotImplementedError
 
     async def aclose(self) -> None:
@@ -137,7 +137,7 @@ def test_order_orchestration_happy_path_commits_reservation_before_provider():
     assert product.reserved_stock == 2
     assert persisted_order.reservation_status == ReservationStatus.ACTIVE
     assert order.payment.copy_paste == f"PIX-{order.id}"
-    assert order.payment.qr_code == f"https://example.test/pix/{order.id}"
+    assert order.payment.qr_code == f"/api/orders/{order.id}/qr"
 
 
 @pytest.mark.parametrize(

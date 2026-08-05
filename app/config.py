@@ -15,8 +15,10 @@ class Settings:
     mercadopago_webhook_secret: str
     payment_provider: str
     charge_expires_in: int
-    payment_expiration_check_interval: int = 60
+    payment_checkout_expires_in: int = 600
+    payment_expiration_check_interval: int = 5
     mercadopago_test_payer_first_name: str | None = None
+    mercadopago_test_payer_email: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -26,7 +28,15 @@ class Settings:
         except ValueError as exc:
             raise RuntimeError("CHARGE_EXPIRES_IN deve ser um número inteiro") from exc
 
-        raw_check_interval = os.getenv("PAYMENT_EXPIRATION_CHECK_INTERVAL", "60")
+        raw_checkout_expiration = os.getenv("PAYMENT_CHECKOUT_EXPIRES_IN", "600")
+        try:
+            payment_checkout_expires_in = int(raw_checkout_expiration)
+        except ValueError as exc:
+            raise RuntimeError(
+                "PAYMENT_CHECKOUT_EXPIRES_IN deve ser um número inteiro"
+            ) from exc
+
+        raw_check_interval = os.getenv("PAYMENT_EXPIRATION_CHECK_INTERVAL", "5")
         try:
             payment_expiration_check_interval = int(raw_check_interval)
         except ValueError as exc:
@@ -41,9 +51,13 @@ class Settings:
             ).strip(),
             payment_provider=os.getenv("PAYMENT_PROVIDER", "").strip().lower(),
             charge_expires_in=charge_expires_in,
+            payment_checkout_expires_in=payment_checkout_expires_in,
             payment_expiration_check_interval=payment_expiration_check_interval,
             mercadopago_test_payer_first_name=(
                 os.getenv("MERCADOPAGO_TEST_PAYER_FIRST_NAME", "").strip() or None
+            ),
+            mercadopago_test_payer_email=(
+                os.getenv("MERCADOPAGO_TEST_PAYER_EMAIL", "").strip() or None
             ),
         )
 
@@ -53,6 +67,15 @@ class Settings:
             raise RuntimeError(f"PAYMENT_PROVIDER deve ser uma destas opções: {allowed}")
         if self.charge_expires_in <= 0:
             raise RuntimeError("CHARGE_EXPIRES_IN deve ser maior que zero")
+        if self.payment_checkout_expires_in <= 0:
+            raise RuntimeError(
+                "PAYMENT_CHECKOUT_EXPIRES_IN deve ser maior que zero"
+            )
+        if self.payment_checkout_expires_in > self.charge_expires_in:
+            raise RuntimeError(
+                "PAYMENT_CHECKOUT_EXPIRES_IN não pode ser maior que "
+                "CHARGE_EXPIRES_IN"
+            )
         if self.payment_expiration_check_interval <= 0:
             raise RuntimeError(
                 "PAYMENT_EXPIRATION_CHECK_INTERVAL deve ser maior que zero"

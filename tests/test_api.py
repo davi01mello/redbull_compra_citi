@@ -82,6 +82,87 @@ def test_order_payment_is_idempotent(client):
     assert first["processed"] is True
     assert second["processed"] is False
 
+    refreshed = client.get(f"/api/orders/{order['id']}").json()
+    assert refreshed["status"] == "PAID"
+    assert refreshed["payment"]["status"] == "APPROVED"
+
+
+def test_order_cancellation_releases_reservation_and_is_idempotent(client):
+    created = client.post(
+        "/api/orders",
+        json={
+            "buyer_name": "Cancelamento",
+            "pricing_audience": "MEMBER",
+            "items": [{"product_id": "original", "quantity": 2}],
+        },
+    )
+    assert created.status_code == 201
+    order = created.json()
+
+    during_reservation = next(
+        product
+        for product in client.get("/api/products").json()
+        if product["id"] == "original"
+    )
+    assert during_reservation["stock"] == INITIAL_STOCK["original"] - 2
+
+    first = client.post(f"/api/orders/{order['id']}/cancel")
+    second = client.post(f"/api/orders/{order['id']}/cancel")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["status"] == "CANCELLED"
+    assert first.json()["payment"]["status"] == "CANCELLED"
+    assert second.json()["status"] == "CANCELLED"
+
+    after_cancellation = next(
+        product
+        for product in client.get("/api/products").json()
+        if product["id"] == "original"
+    )
+    assert after_cancellation["stock"] == INITIAL_STOCK["original"]
+
+    simulated_payment = client.post(f"/api/mock/pay/{order['payment']['txid']}")
+    assert simulated_payment.status_code == 409
+
+
+def test_paid_order_cannot_be_cancelled(client):
+    created = client.post(
+        "/api/orders",
+        json={
+            "buyer_name": "Já pago",
+            "pricing_audience": "MEMBER",
+            "items": [{"product_id": "original", "quantity": 1}],
+        },
+    ).json()
+    paid = client.post(f"/api/mock/pay/{created['payment']['txid']}")
+    assert paid.status_code == 200
+
+    cancellation = client.post(f"/api/orders/{created['id']}/cancel")
+    assert cancellation.status_code == 409
+    assert "já foi confirmado" in cancellation.json()["detail"]
+
+
+def test_order_exposes_locally_generated_pix_qr(client):
+    created = client.post(
+        "/api/orders",
+        json={
+            "buyer_name": "QR local",
+            "pricing_audience": "MEMBER",
+            "items": [{"product_id": "original", "quantity": 1}],
+        },
+    )
+    assert created.status_code == 201
+    order = created.json()
+    assert order["payment"]["qr_code"] == f"/api/orders/{order['id']}/qr"
+    assert order["payment"]["status"] == "WAITING_PAYMENT"
+    assert order["payment"]["expires_at"] is not None
+
+    qr = client.get(order["payment"]["qr_code"])
+    assert qr.status_code == 200
+    assert qr.headers["content-type"].startswith("image/svg+xml")
+    assert qr.headers["cache-control"] == "no-store"
+    assert b"<svg" in qr.content
+
 
 @pytest.mark.parametrize(
     ("quantity", "unit_price", "total"),

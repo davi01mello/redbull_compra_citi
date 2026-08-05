@@ -165,7 +165,10 @@ class PaymentORM(Base):
         Enum(PaymentProvider, name="payment_provider"),
         nullable=False,
     )
-    provider_order_id: Mapped[str | None] = mapped_column(String(120))
+    provider_order_id: Mapped[str | None] = mapped_column(
+        String(120),
+        unique=True,
+    )
     provider_payment_id: Mapped[str | None] = mapped_column(
         String(120),
         unique=True,
@@ -208,6 +211,7 @@ class WebhookEventORM(Base):
     )
     event_id: Mapped[str] = mapped_column(String(120), primary_key=True)
     event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    provider_order_id: Mapped[str | None] = mapped_column(String(120))
     provider_payment_id: Mapped[str | None] = mapped_column(String(120))
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

@@ -1,11 +1,15 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from io import BytesIO
 from pathlib import Path
+from uuid import UUID
 
+import qrcode
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from qrcode.image.svg import SvgPathImage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import settings
@@ -25,7 +29,9 @@ from .payments import (
     verify_mercadopago_signature,
 )
 from .payment_service import (
+    PaymentCancellationConflict,
     PaymentServiceError,
+    cancel_order_payment,
     create_order_with_payment,
     expire_due_payments,
     list_manual_reviews,
@@ -37,12 +43,15 @@ BASE_DIR = Path(__file__).resolve().parent
 logger = logging.getLogger(__name__)
 
 
-async def _expiration_loop(interval_seconds: int) -> None:
+async def _expiration_loop(interval_seconds: int, payment_provider) -> None:
     while True:
         await asyncio.sleep(interval_seconds)
         try:
             async with AsyncSessionLocal() as db:
-                expired = await expire_due_payments(db)
+                expired = await expire_due_payments(
+                    db,
+                    provider=payment_provider,
+                )
             if expired:
                 logger.info("Cobranças expiradas e reservas liberadas: %s", expired)
         except asyncio.CancelledError:
@@ -57,7 +66,10 @@ async def lifespan(app: FastAPI):
     app.state.payment_provider = payment_provider
     app.state.payment_settings = settings
     expiration_task = asyncio.create_task(
-        _expiration_loop(settings.payment_expiration_check_interval),
+        _expiration_loop(
+            settings.payment_expiration_check_interval,
+            payment_provider,
+        ),
         name="payment-expiration-loop",
     )
     try:
@@ -123,6 +135,50 @@ async def get_order(order_id: str, db: AsyncSession = Depends(get_db)) -> Order:
     return await store.get_order(db, order_id)
 
 
+@app.post("/api/orders/{order_id}/cancel", response_model=Order)
+async def cancel_order(
+    order_id: UUID,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> Order:
+    try:
+        return await cancel_order_payment(
+            db,
+            order_id,
+            request.app.state.payment_provider,
+        )
+    except PaymentCancellationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except PaymentServiceError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/orders/{order_id}/qr")
+async def order_pix_qr(
+    order_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    order = await store.get_order(db, order_id)
+    qr = qrcode.QRCode(
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(order.payment.copy_paste)
+    qr.make(fit=True)
+    image = qr.make_image(image_factory=SvgPathImage)
+    buffer = BytesIO()
+    image.save(buffer)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="image/svg+xml",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.get("/api/manual-reviews", response_model=list[ManualReview])
 async def manual_reviews(
     unresolved_only: bool = True,
@@ -139,24 +195,24 @@ async def mercadopago_webhook(
     x_request_id: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    payment_id = str(payload.data.id)
+    provider_order_id = str(payload.data.id)
     webhook_secret = request.app.state.payment_settings.mercadopago_webhook_secret
     if not verify_mercadopago_signature(
         x_signature,
         x_request_id,
-        payment_id,
+        provider_order_id,
         webhook_secret,
     ):
         raise HTTPException(401, "Assinatura do webhook inválida")
 
     try:
-        provider_payment = await request.app.state.payment_provider.get_payment(
-            payment_id
+        provider_payment = await request.app.state.payment_provider.get_order(
+            provider_order_id
         )
     except PaymentProviderError as exc:
         logger.warning(
-            "Falha ao consultar pagamento Mercado Pago payment_id=%s: %s",
-            payment_id,
+            "Falha ao consultar order Mercado Pago provider_order_id=%s: %s",
+            provider_order_id,
             exc,
         )
         raise HTTPException(503, "Não foi possível confirmar o pagamento") from exc
@@ -165,21 +221,23 @@ async def mercadopago_webhook(
         db,
         event_id=str(payload.id),
         event_type=payload.action or payload.type,
-        webhook_payment_id=payment_id,
+        webhook_order_id=provider_order_id,
         provider_payment=provider_payment,
     )
-    if result.outcome in {"already_paid", "not_approved", "unknown_payment"}:
+    if result.outcome in {"already_paid", "not_approved", "unknown_order"}:
         logger.info(
-            "Webhook Mercado Pago reconhecido: outcome=%s payment_id=%s order_id=%s",
+            "Webhook Mercado Pago reconhecido: outcome=%s provider_order_id=%s "
+            "order_id=%s",
             result.outcome,
-            payment_id,
+            provider_order_id,
             result.order_id,
         )
     elif not result.processed:
         logger.warning(
-            "Webhook Mercado Pago não processado: outcome=%s payment_id=%s order_id=%s",
+            "Webhook Mercado Pago não processado: outcome=%s "
+            "provider_order_id=%s order_id=%s",
             result.outcome,
-            payment_id,
+            provider_order_id,
             result.order_id,
         )
     elif result.outcome != "approved":
@@ -187,7 +245,7 @@ async def mercadopago_webhook(
             "Pagamento tardio Mercado Pago confirmado: outcome=%s "
             "payment_id=%s order_id=%s",
             result.outcome,
-            payment_id,
+            provider_payment.provider_payment_id,
             result.order_id,
         )
     return {

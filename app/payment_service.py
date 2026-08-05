@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+import logging
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
@@ -34,7 +35,14 @@ from .payments import (
 from .store import store
 
 
+logger = logging.getLogger(__name__)
+
+
 class PaymentServiceError(RuntimeError):
+    pass
+
+
+class PaymentCancellationConflict(PaymentServiceError):
     pass
 
 
@@ -49,11 +57,16 @@ class WebhookProcessingResult:
             "approved",
             "approved_late",
             "approved_late_stock_conflict",
+            "approved_after_cancellation",
         }
 
 
 def payment_idempotency_key(order_id: UUID) -> str:
     return f"redbull-order-{order_id}"
+
+
+def cancellation_idempotency_key(order_id: UUID) -> str:
+    return f"redbull-order-{order_id}-cancel"
 
 
 def _provider_name(provider: PaymentProvider) -> PaymentProviderName:
@@ -106,6 +119,7 @@ async def _prepare_payment(
             if payment.status in {
                 PaymentStatus.FAILED,
                 PaymentStatus.EXPIRED,
+                PaymentStatus.CANCELLED,
             }:
                 raise PaymentServiceError(
                     "A cobrança deste pedido não pode ser gerada novamente"
@@ -216,11 +230,147 @@ async def create_order_with_payment(
     return await ensure_order_payment(db, reserved_order.id, provider)
 
 
+async def cancel_order_payment(
+    db: AsyncSession,
+    order_id: UUID,
+    provider: PaymentProvider,
+) -> Order:
+    provider_name = _provider_name(provider)
+    already_cancelled = False
+    provider_order_id: str | None = None
+
+    async with db.begin():
+        order = (
+            await db.execute(
+                select(OrderORM).where(OrderORM.id == order_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        payment = (
+            await db.execute(
+                select(PaymentORM)
+                .where(PaymentORM.order_id == order_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if order is None or payment is None:
+            raise PaymentCancellationConflict("Pedido não encontrado")
+        if payment.provider != provider_name:
+            raise PaymentCancellationConflict(
+                "O pedido está vinculado a outro provedor de pagamento"
+            )
+        if (
+            order.status == OrderStatus.CANCELLED
+            and payment.status == PaymentStatus.CANCELLED
+        ):
+            already_cancelled = True
+        elif order.status == OrderStatus.PAID or payment.status == PaymentStatus.APPROVED:
+            raise PaymentCancellationConflict(
+                "O pagamento já foi confirmado e não pode ser cancelado"
+            )
+        elif payment.status not in {
+            PaymentStatus.CREATING,
+            PaymentStatus.WAITING_PAYMENT,
+        }:
+            raise PaymentCancellationConflict(
+                "Esta cobrança não está mais disponível para cancelamento"
+            )
+        provider_order_id = payment.provider_order_id
+
+    if already_cancelled:
+        return await _load_order(db, order_id)
+    if not provider_order_id:
+        raise PaymentCancellationConflict(
+            "A cobrança ainda não possui um identificador no provedor"
+        )
+
+    try:
+        await provider.cancel_order(
+            provider_order_id,
+            cancellation_idempotency_key(order_id),
+        )
+    except PaymentProviderError as exc:
+        try:
+            provider_payment = await provider.get_order(provider_order_id)
+        except PaymentProviderError:
+            provider_payment = None
+        if provider_payment is not None and provider_payment.status.upper() == "APPROVED":
+            reconciliation = await process_mercadopago_payment(
+                db,
+                event_id=f"cancel-reconciliation-{provider_order_id}",
+                event_type="cancel.reconciliation",
+                webhook_order_id=provider_order_id,
+                provider_payment=provider_payment,
+            )
+            if reconciliation.processed or reconciliation.outcome == "already_paid":
+                raise PaymentCancellationConflict(
+                    "O pagamento foi aprovado antes do cancelamento e já foi confirmado."
+                ) from exc
+        raise PaymentServiceError(
+            "Não foi possível interromper a cobrança. Tente novamente."
+        ) from exc
+
+    now = datetime.now(UTC)
+    async with db.begin():
+        order = (
+            await db.execute(
+                select(OrderORM).where(OrderORM.id == order_id).with_for_update()
+            )
+        ).scalar_one()
+        payment = (
+            await db.execute(
+                select(PaymentORM)
+                .where(PaymentORM.order_id == order_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+
+        if (
+            order.status == OrderStatus.CANCELLED
+            and payment.status == PaymentStatus.CANCELLED
+        ):
+            pass
+        elif order.status == OrderStatus.PAID or payment.status == PaymentStatus.APPROVED:
+            raise PaymentCancellationConflict(
+                "O pagamento foi confirmado enquanto o cancelamento era processado"
+            )
+        elif payment.status not in {
+            PaymentStatus.CREATING,
+            PaymentStatus.WAITING_PAYMENT,
+        }:
+            raise PaymentCancellationConflict(
+                "A cobrança mudou de estado enquanto era cancelada"
+            )
+        else:
+            if order.reservation_status == ReservationStatus.ACTIVE:
+                quantities = await _load_quantities(db, order_id)
+                product_ids = sorted(quantities)
+                products = await _lock_products(db, product_ids)
+                for product_id in product_ids:
+                    product = products.get(product_id)
+                    quantity = quantities[product_id]
+                    if product is None or product.reserved_stock < quantity:
+                        raise RuntimeError(
+                            f"Reserva inconsistente para o produto '{product_id}'"
+                        )
+                for product_id in product_ids:
+                    products[product_id].reserved_stock -= quantities[product_id]
+                order.reservation_status = ReservationStatus.RELEASED
+
+            order.status = OrderStatus.CANCELLED
+            payment.status = PaymentStatus.CANCELLED
+            payment.updated_at = now
+            await db.flush()
+
+    return await _load_order(db, order_id)
+
+
 async def _record_webhook_event(
     db: AsyncSession,
     event_id: str,
     event_type: str,
-    provider_payment_id: str,
+    provider_order_id: str,
+    provider_payment_id: str | None,
 ) -> None:
     statement = (
         insert(WebhookEventORM)
@@ -228,6 +378,7 @@ async def _record_webhook_event(
             provider=PaymentProviderName.MERCADOPAGO,
             event_id=event_id,
             event_type=event_type,
+            provider_order_id=provider_order_id,
             provider_payment_id=provider_payment_id,
             processed_at=datetime.now(UTC),
         )
@@ -321,13 +472,18 @@ async def _lock_products(
 async def expire_due_payments(
     db: AsyncSession,
     as_of: datetime | None = None,
+    provider: PaymentProvider | None = None,
 ) -> int:
     cutoff = as_of or datetime.now(UTC)
     async with db.begin():
-        candidate_order_ids = list(
+        candidate_payments = list(
             (
                 await db.execute(
-                    select(PaymentORM.order_id)
+                    select(
+                        PaymentORM.order_id,
+                        PaymentORM.provider,
+                        PaymentORM.provider_order_id,
+                    )
                     .where(
                         PaymentORM.status.in_(
                             {
@@ -340,8 +496,37 @@ async def expire_due_payments(
                     )
                     .order_by(PaymentORM.expires_at, PaymentORM.order_id)
                 )
-            ).scalars()
+            ).all()
         )
+
+    candidate_order_ids: list[UUID] = []
+    configured_provider = _provider_name(provider) if provider is not None else None
+    for order_id, payment_provider, provider_order_id in candidate_payments:
+        if provider is not None:
+            if payment_provider != configured_provider:
+                logger.warning(
+                    "Cobrança vencida usa provedor diferente do configurado: "
+                    "order_id=%s provider=%s",
+                    order_id,
+                    payment_provider.value,
+                )
+                continue
+            if provider_order_id:
+                try:
+                    await provider.cancel_order(
+                        provider_order_id,
+                        cancellation_idempotency_key(order_id),
+                    )
+                except PaymentProviderError as exc:
+                    logger.warning(
+                        "Não foi possível cancelar cobrança vencida no provedor: "
+                        "order_id=%s provider_order_id=%s error=%s",
+                        order_id,
+                        provider_order_id,
+                        exc,
+                    )
+                    continue
+        candidate_order_ids.append(order_id)
 
     expired = 0
     for order_id in candidate_order_ids:
@@ -399,13 +584,17 @@ async def process_mercadopago_payment(
     db: AsyncSession,
     event_id: str,
     event_type: str,
-    webhook_payment_id: str,
+    webhook_order_id: str,
     provider_payment: PaymentResult,
 ) -> WebhookProcessingResult:
     async with db.begin():
-        if provider_payment.provider_payment_id != webhook_payment_id:
+        if provider_payment.provider_order_id != webhook_order_id:
             await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("provider_id_mismatch")
 
@@ -415,20 +604,28 @@ async def process_mercadopago_payment(
                 .where(
                     PaymentORM.provider
                     == PaymentProviderName.MERCADOPAGO,
-                    PaymentORM.provider_payment_id == webhook_payment_id,
+                    PaymentORM.provider_order_id == webhook_order_id,
                 )
             )
         ).one_or_none()
         if payment_reference is None:
             await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
             )
-            return WebhookProcessingResult("unknown_payment")
+            return WebhookProcessingResult("unknown_order")
 
         payment_id, order_id = payment_reference
         if provider_payment.status.upper() != "APPROVED":
             await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("not_approved", order_id)
         if provider_payment.approved_at is None:
@@ -439,7 +636,11 @@ async def process_mercadopago_payment(
                 "O provedor informou pagamento aprovado sem date_approved.",
             )
             await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("missing_approved_at", order_id)
 
@@ -459,12 +660,20 @@ async def process_mercadopago_payment(
 
         if order.status == OrderStatus.PAID:
             await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("already_paid", order_id)
         if payment.status == PaymentStatus.APPROVED:
             await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("inconsistent_payment_state", order_id)
         if Decimal(payment.amount) != provider_payment.amount:
@@ -476,17 +685,24 @@ async def process_mercadopago_payment(
                 f"{provider_payment.amount} {provider_payment.currency}.",
             )
             await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("amount_mismatch", order_id)
 
-        late_after_expiration = (
+        late_after_release = (
             order.reservation_status == ReservationStatus.RELEASED
-            and payment.status == PaymentStatus.EXPIRED
+            and payment.status in {
+                PaymentStatus.EXPIRED,
+                PaymentStatus.CANCELLED,
+            }
         )
         if (
             order.reservation_status != ReservationStatus.ACTIVE
-            and not late_after_expiration
+            and not late_after_release
         ):
             await _flag_manual_review(
                 db,
@@ -496,7 +712,11 @@ async def process_mercadopago_payment(
                 f"{payment.status.value}.",
             )
             await _record_webhook_event(
-                db, event_id, event_type, webhook_payment_id
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("reservation_not_active", order_id)
 
@@ -504,7 +724,15 @@ async def process_mercadopago_payment(
         product_ids = sorted(quantities)
         products = await _lock_products(db, product_ids)
         outcome = "approved"
-        if late_after_expiration:
+        if late_after_release:
+            cancelled_by_buyer = payment.status == PaymentStatus.CANCELLED
+            if cancelled_by_buyer:
+                await _flag_manual_review(
+                    db,
+                    order_id,
+                    ManualReviewReason.PAYMENT_AFTER_CANCELLATION,
+                    "O provedor confirmou um pagamento após o cancelamento do comprador.",
+                )
             conflicts: list[str] = []
             for product_id in product_ids:
                 product = products.get(product_id)
@@ -525,6 +753,8 @@ async def process_mercadopago_payment(
                     + ", ".join(conflicts),
                 )
                 outcome = "approved_late_stock_conflict"
+            elif cancelled_by_buyer:
+                outcome = "approved_after_cancellation"
             else:
                 outcome = "approved_late"
         else:
@@ -537,7 +767,11 @@ async def process_mercadopago_payment(
                     or product.stock < quantity
                 ):
                     await _record_webhook_event(
-                        db, event_id, event_type, webhook_payment_id
+                        db,
+                        event_id,
+                        event_type,
+                        webhook_order_id,
+                        provider_payment.provider_payment_id,
                     )
                     return WebhookProcessingResult("inconsistent_stock", order_id)
 
@@ -552,7 +786,13 @@ async def process_mercadopago_payment(
         order.status = OrderStatus.PAID
         order.paid_at = provider_payment.approved_at
         order.reservation_status = ReservationStatus.CONSUMED
-        await _record_webhook_event(db, event_id, event_type, webhook_payment_id)
+        await _record_webhook_event(
+            db,
+            event_id,
+            event_type,
+            webhook_order_id,
+            provider_payment.provider_payment_id,
+        )
         await db.flush()
 
         return WebhookProcessingResult(outcome, order_id)

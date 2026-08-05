@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class OrderStatus(StrEnum):
     PENDING = "PENDING"
     PAID = "PAID"
+    CANCELLED = "CANCELLED"
 
 
 class PricingAudience(StrEnum):
@@ -27,6 +28,7 @@ class PaymentStatus(StrEnum):
     APPROVED = "APPROVED"
     EXPIRED = "EXPIRED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class PaymentProvider(StrEnum):
@@ -39,6 +41,7 @@ class ManualReviewReason(StrEnum):
     MISSING_APPROVED_AT = "MISSING_APPROVED_AT"
     LATE_PAYMENT_STOCK_CONFLICT = "LATE_PAYMENT_STOCK_CONFLICT"
     RESERVATION_NOT_ACTIVE = "RESERVATION_NOT_ACTIVE"
+    PAYMENT_AFTER_CANCELLATION = "PAYMENT_AFTER_CANCELLATION"
 
 
 class Product(BaseModel):
@@ -73,6 +76,8 @@ class PaymentData(BaseModel):
     txid: str
     qr_code: str
     copy_paste: str
+    status: PaymentStatus
+    expires_at: datetime | None = None
     simulated: bool = True
 
 
@@ -103,8 +108,8 @@ class MercadoPagoWebhookData(BaseModel):
 
 class MercadoPagoWebhookPayload(BaseModel):
     id: str | int
-    type: str = Field(default="payment", max_length=120)
-    action: str = Field(default="payment.updated", max_length=120)
+    type: str = Field(default="order", max_length=120)
+    action: str = Field(default="order.updated", max_length=120)
     data: MercadoPagoWebhookData
 
 

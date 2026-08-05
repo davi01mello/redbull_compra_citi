@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
@@ -32,7 +32,8 @@ class ChargeResult:
 
 @dataclass(frozen=True)
 class PaymentResult:
-    provider_payment_id: str
+    provider_order_id: str
+    provider_payment_id: str | None
     status: str
     amount: Decimal
     currency: str
@@ -49,7 +50,13 @@ class PaymentProvider(Protocol):
         idempotency_key: str,
     ) -> ChargeResult: ...
 
-    async def get_payment(self, payment_id: str) -> PaymentResult: ...
+    async def get_order(self, order_id: str) -> PaymentResult: ...
+
+    async def cancel_order(
+        self,
+        order_id: str,
+        idempotency_key: str,
+    ) -> None: ...
 
     async def aclose(self) -> None: ...
 
@@ -71,7 +78,7 @@ class MockPaymentProvider:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._payments: dict[str, PaymentResult] = {}
+        self._orders: dict[str, PaymentResult] = {}
 
     async def create_charge(
         self,
@@ -84,9 +91,10 @@ class MockPaymentProvider:
         provider_order_id = f"MOCK-ORDER-{external_reference}"
         provider_payment_id = f"MOCK-PAYMENT-{external_reference}"
         expires_at = datetime.now(UTC) + timedelta(
-            seconds=self.settings.charge_expires_in
+            seconds=self.settings.payment_checkout_expires_in
         )
-        self._payments[provider_payment_id] = PaymentResult(
+        self._orders[provider_order_id] = PaymentResult(
+            provider_order_id=provider_order_id,
             provider_payment_id=provider_payment_id,
             status="WAITING_PAYMENT",
             amount=amount,
@@ -104,11 +112,19 @@ class MockPaymentProvider:
             expires_at=expires_at,
         )
 
-    async def get_payment(self, payment_id: str) -> PaymentResult:
+    async def get_order(self, order_id: str) -> PaymentResult:
         try:
-            return self._payments[payment_id]
+            return self._orders[order_id]
         except KeyError as exc:
-            raise PaymentProviderError("Pagamento mock não encontrado") from exc
+            raise PaymentProviderError("Order mock não encontrada") from exc
+
+    async def cancel_order(self, order_id: str, idempotency_key: str) -> None:
+        if not idempotency_key:
+            raise PaymentProviderError("A chave de idempotência é obrigatória")
+        current = self._orders.get(order_id)
+        if current is None:
+            raise PaymentProviderError("Order mock não encontrada")
+        self._orders[order_id] = replace(current, status="CANCELLED")
 
     async def aclose(self) -> None:
         return None
@@ -143,10 +159,17 @@ class MercadoPagoProvider:
             raise PaymentProviderError("A chave de idempotência é obrigatória")
 
         amount_text = f"{amount:.2f}"
-        expires_at = datetime.now(UTC) + timedelta(
+        now = datetime.now(UTC)
+        provider_expires_at = now + timedelta(
             seconds=self.settings.charge_expires_in
         )
-        payer = {"email": MERCADOPAGO_FALLBACK_PAYER_EMAIL}
+        checkout_expires_at = now + timedelta(
+            seconds=self.settings.payment_checkout_expires_in
+        )
+        payer = {
+            "email": self.settings.mercadopago_test_payer_email
+            or MERCADOPAGO_FALLBACK_PAYER_EMAIL
+        }
         if self.settings.mercadopago_test_payer_first_name:
             payer["first_name"] = self.settings.mercadopago_test_payer_first_name
         payload = {
@@ -193,19 +216,23 @@ class MercadoPagoProvider:
                 "Resposta inválida ao criar a cobrança no Mercado Pago"
             ) from exc
 
-        return self._parse_charge(data, amount, expires_at)
+        charge = self._parse_charge(data, amount, provider_expires_at)
+        return replace(
+            charge,
+            expires_at=min(charge.expires_at, checkout_expires_at),
+        )
 
-    async def get_payment(self, payment_id: str) -> PaymentResult:
+    async def get_order(self, order_id: str) -> PaymentResult:
         try:
             response = await self._client.get(
-                f"/v1/payments/{payment_id}",
+                f"/v1/orders/{order_id}",
                 headers=self._headers,
             )
             response.raise_for_status()
             data = response.json()
         except httpx.TimeoutException as exc:
             raise PaymentProviderError(
-                "Tempo esgotado ao consultar o pagamento no Mercado Pago"
+                "Tempo esgotado ao consultar a order no Mercado Pago"
             ) from exc
         except httpx.HTTPStatusError as exc:
             detail = self._error_detail(exc.response)
@@ -214,29 +241,87 @@ class MercadoPagoProvider:
             ) from exc
         except (httpx.TransportError, ValueError) as exc:
             raise PaymentProviderError(
-                "Resposta inválida ao consultar o pagamento no Mercado Pago"
+                "Resposta inválida ao consultar a order no Mercado Pago"
             ) from exc
 
         if not isinstance(data, dict):
             raise PaymentProviderError("O Mercado Pago retornou uma resposta inválida")
-        provider_payment_id = data.get("id")
-        if provider_payment_id is None or not data.get("status"):
+        provider_order_id = data.get("id")
+        transactions = data.get("transactions")
+        if not isinstance(transactions, dict):
             raise PaymentProviderError(
-                "O Mercado Pago retornou um pagamento incompleto"
+                "O Mercado Pago retornou uma order incompleta"
             )
+        payments = transactions.get("payments")
+        payment = payments[0] if isinstance(payments, list) and payments else None
+        if not provider_order_id or not data.get("status") or not isinstance(payment, dict):
+            raise PaymentProviderError("O Mercado Pago retornou uma order incompleta")
+
+        order_status = str(data["status"]).lower()
+        order_status_detail = str(data.get("status_detail") or "").lower()
+        payment_status = str(payment.get("status") or "").lower()
+        payment_status_detail = str(payment.get("status_detail") or "").lower()
+        approved = (
+            order_status == "processed"
+            and order_status_detail == "accredited"
+            and payment_status == "processed"
+            and payment_status_detail == "accredited"
+        )
         try:
-            amount = Decimal(str(data["transaction_amount"]))
+            raw_amount = (
+                payment.get("paid_amount")
+                if approved
+                else payment.get("amount")
+            )
+            if raw_amount is None:
+                raw_amount = data.get("total_paid_amount") or data["total_amount"]
+            amount = Decimal(str(raw_amount))
         except (KeyError, InvalidOperation, TypeError, ValueError) as exc:
             raise PaymentProviderError(
                 "O Mercado Pago retornou um valor de pagamento inválido"
             ) from exc
         return PaymentResult(
-            provider_payment_id=str(provider_payment_id),
-            status=str(data["status"]).upper(),
+            provider_order_id=str(provider_order_id),
+            provider_payment_id=(
+                str(payment["id"]) if payment.get("id") is not None else None
+            ),
+            status="APPROVED" if approved else str(data["status"]).upper(),
             amount=amount,
-            currency=str(data.get("currency_id") or "BRL"),
-            approved_at=_parse_datetime(data.get("date_approved")),
+            currency=str(data.get("currency") or "BRL"),
+            approved_at=(
+                _parse_datetime(data.get("last_updated_date")) if approved else None
+            ),
         )
+
+    async def cancel_order(self, order_id: str, idempotency_key: str) -> None:
+        if not idempotency_key:
+            raise PaymentProviderError("A chave de idempotência é obrigatória")
+        try:
+            response = await self._client.post(
+                f"/v1/orders/{order_id}/cancel",
+                headers={
+                    **self._headers,
+                    "X-Idempotency-Key": idempotency_key,
+                },
+            )
+            if response.status_code == 409 and self._error_code(response) == (
+                "order_already_canceled"
+            ):
+                return
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise PaymentProviderError(
+                "Tempo esgotado ao cancelar a order no Mercado Pago"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            detail = self._error_detail(exc.response)
+            raise PaymentProviderError(
+                f"Mercado Pago recusou o cancelamento: {detail}"
+            ) from exc
+        except httpx.TransportError as exc:
+            raise PaymentProviderError(
+                "Falha de comunicação ao cancelar a order no Mercado Pago"
+            ) from exc
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -300,6 +385,25 @@ class MercadoPagoProvider:
             or data.get("details")
             or response.status_code
         )
+
+    @staticmethod
+    def _error_code(response: httpx.Response) -> str | None:
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        code = data.get("code") or data.get("error")
+        if not code:
+            for key in ("errors", "details", "cause"):
+                entries = data.get(key)
+                if isinstance(entries, list) and entries:
+                    first = entries[0]
+                    if isinstance(first, dict) and first.get("code"):
+                        code = first["code"]
+                        break
+        return str(code) if code else None
 
 
 def verify_mercadopago_signature(

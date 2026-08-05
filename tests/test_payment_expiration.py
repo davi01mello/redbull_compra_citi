@@ -26,11 +26,13 @@ from app.models import (
     ReservationStatus,
 )
 from app.payment_service import (
+    PaymentCancellationConflict,
+    cancel_order_payment,
     create_order_with_payment,
     expire_due_payments,
     process_mercadopago_payment,
 )
-from app.payments import ChargeResult, PaymentResult
+from app.payments import ChargeResult, PaymentProviderError, PaymentResult
 from app.store import store
 
 
@@ -42,7 +44,9 @@ class ExpirationTestProvider:
     provider_name = "mercadopago"
 
     def __init__(self) -> None:
-        self.payments: dict[str, PaymentResult] = {}
+        self.orders: dict[str, PaymentResult] = {}
+        self.order_ids_by_payment_id: dict[str, str] = {}
+        self.cancelled_order_ids: list[str] = []
 
     async def create_charge(
         self,
@@ -50,16 +54,19 @@ class ExpirationTestProvider:
         amount: Decimal,
         idempotency_key: str,
     ) -> ChargeResult:
+        order_id = f"expiration-order-{external_reference}"
         payment_id = f"expiration-payment-{external_reference}"
-        self.payments[payment_id] = PaymentResult(
+        self.orders[order_id] = PaymentResult(
+            provider_order_id=order_id,
             provider_payment_id=payment_id,
             status="PENDING",
             amount=amount,
             currency="BRL",
             approved_at=None,
         )
+        self.order_ids_by_payment_id[payment_id] = order_id
         return ChargeResult(
-            provider_order_id=f"expiration-order-{external_reference}",
+            provider_order_id=order_id,
             provider_payment_id=payment_id,
             qr_code=f"https://example.test/{external_reference}",
             copy_paste=f"PIX-{external_reference}",
@@ -67,23 +74,43 @@ class ExpirationTestProvider:
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
         )
 
-    async def get_payment(self, payment_id: str) -> PaymentResult:
-        return self.payments[payment_id]
+    async def get_order(self, order_id: str) -> PaymentResult:
+        return self.orders[order_id]
+
+    async def cancel_order(self, order_id: str, idempotency_key: str) -> None:
+        assert idempotency_key.endswith("-cancel")
+        self.cancelled_order_ids.append(order_id)
+        current = self.orders[order_id]
+        self.orders[order_id] = PaymentResult(
+            provider_order_id=current.provider_order_id,
+            provider_payment_id=current.provider_payment_id,
+            status="CANCELLED",
+            amount=current.amount,
+            currency=current.currency,
+            approved_at=None,
+        )
 
     async def aclose(self) -> None:
         return None
 
     def approve(self, payment_id: str, amount: Decimal | None = None) -> PaymentResult:
-        current = self.payments[payment_id]
+        order_id = self.order_ids_by_payment_id[payment_id]
+        current = self.orders[order_id]
         approved = PaymentResult(
+            provider_order_id=order_id,
             provider_payment_id=payment_id,
             status="APPROVED",
             amount=amount if amount is not None else current.amount,
             currency="BRL",
             approved_at=APPROVED_AT,
         )
-        self.payments[payment_id] = approved
+        self.orders[order_id] = approved
         return approved
+
+
+class ApprovalDuringCancellationProvider(ExpirationTestProvider):
+    async def cancel_order(self, order_id: str, idempotency_key: str) -> None:
+        raise PaymentProviderError("cannot_cancel_order: processed")
 
 
 async def reset_database(stock_overrides: dict[str, int] | None = None) -> None:
@@ -132,8 +159,8 @@ async def process_approved(provider, order, event_id: str):
         return await process_mercadopago_payment(
             session,
             event_id=event_id,
-            event_type="payment.updated",
-            webhook_payment_id=payment_id,
+            event_type="order.updated",
+            webhook_order_id=provider_payment.provider_order_id,
             provider_payment=provider_payment,
         )
 
@@ -202,6 +229,72 @@ def test_due_payment_expires_and_releases_reservation_without_cancelling_order()
     }
 
 
+def test_due_payment_is_cancelled_at_provider_before_local_expiration():
+    async def scenario():
+        await reset_database()
+        provider = ExpirationTestProvider()
+        order = await create_order(provider)
+        cutoff = datetime.now(UTC)
+        await make_due(order.id, cutoff)
+        async with AsyncSessionLocal() as session:
+            expired = await expire_due_payments(
+                session,
+                cutoff,
+                provider=provider,
+            )
+        return expired, provider.cancelled_order_ids, await load_state(order.id)
+
+    expired, cancelled_order_ids, state = asyncio.run(scenario())
+    assert expired == 1
+    assert len(cancelled_order_ids) == 1
+    assert state["payment_status"] == PaymentStatus.EXPIRED
+    assert state["reservation_status"] == ReservationStatus.RELEASED
+
+
+def test_payment_confirmed_after_buyer_cancellation_is_reconciled_and_flagged():
+    async def scenario():
+        await reset_database()
+        provider = ExpirationTestProvider()
+        order = await create_order(provider)
+        async with AsyncSessionLocal() as session:
+            cancelled = await cancel_order_payment(session, order.id, provider)
+        result = await process_approved(
+            provider,
+            cancelled,
+            "event-after-buyer-cancellation",
+        )
+        return result, await load_state(order.id)
+
+    result, state = asyncio.run(scenario())
+    assert result.outcome == "approved_after_cancellation"
+    assert state["order_status"] == OrderStatus.PAID
+    assert state["payment_status"] == PaymentStatus.APPROVED
+    assert state["reservation_status"] == ReservationStatus.CONSUMED
+    assert state["stock"] == INITIAL_STOCK["original"] - 1
+    assert state["review_reasons"] == [
+        ManualReviewReason.PAYMENT_AFTER_CANCELLATION.value
+    ]
+
+
+def test_approval_racing_with_cancellation_is_reconciled_as_paid():
+    async def scenario():
+        await reset_database()
+        provider = ApprovalDuringCancellationProvider()
+        order = await create_order(provider)
+        provider.approve(order.payment.txid)
+        async with AsyncSessionLocal() as session:
+            with pytest.raises(PaymentCancellationConflict):
+                await cancel_order_payment(session, order.id, provider)
+        return await load_state(order.id)
+
+    state = asyncio.run(scenario())
+    assert state["order_status"] == OrderStatus.PAID
+    assert state["payment_status"] == PaymentStatus.APPROVED
+    assert state["reservation_status"] == ReservationStatus.CONSUMED
+    assert state["stock"] == INITIAL_STOCK["original"] - 1
+    assert state["reserved_stock"] == 0
+
+
 def test_expiration_is_idempotent():
     async def scenario():
         await reset_database()
@@ -239,8 +332,8 @@ def test_expiration_and_webhook_race_keep_one_consistent_final_state():
                 return await process_mercadopago_payment(
                     session,
                     event_id="expiration-race",
-                    event_type="payment.updated",
-                    webhook_payment_id=order.payment.txid,
+                    event_type="order.updated",
+                    webhook_order_id=provider_payment.provider_order_id,
                     provider_payment=provider_payment,
                 )
 
@@ -366,6 +459,7 @@ def test_webhook_anomalies_are_listed_for_manual_review(
         provider = ExpirationTestProvider()
         order = await create_order(provider, "Revisão manual")
         provider_payment = PaymentResult(
+            provider_order_id=provider.order_ids_by_payment_id[order.payment.txid],
             provider_payment_id=order.payment.txid,
             status="APPROVED",
             amount=amount,
@@ -376,8 +470,8 @@ def test_webhook_anomalies_are_listed_for_manual_review(
             result = await process_mercadopago_payment(
                 session,
                 event_id=f"review-{expected_outcome}",
-                event_type="payment.updated",
-                webhook_payment_id=order.payment.txid,
+                event_type="order.updated",
+                webhook_order_id=provider_payment.provider_order_id,
                 provider_payment=provider_payment,
             )
         return order, result

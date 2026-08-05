@@ -12,6 +12,14 @@ const state = {
 const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
 const el = id => document.getElementById(id);
 const escapeHtml = value => String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
+const PAYMENT_POLL_INTERVAL_MS = 2500;
+
+let paymentPollTimer = null;
+let paymentPollInFlight = false;
+let paymentPollSession = 0;
+let paymentCountdownTimer = null;
+let paymentCountdownExpiresAt = null;
+let paymentCancelling = false;
 
 let toastTimer;
 function toast(message) {
@@ -194,6 +202,168 @@ function renderSuccess() {
   el('success-items').innerHTML = state.order.items.map(item => `${item.quantity}× ${escapeHtml(item.product_name.replace('Energy ', ''))}`).join('<br>');
 }
 
+function stopPaymentPolling() {
+  paymentPollSession += 1;
+  if (paymentPollTimer !== null) {
+    clearInterval(paymentPollTimer);
+    paymentPollTimer = null;
+  }
+  stopPaymentCountdown();
+}
+
+function stopPaymentCountdown() {
+  if (paymentCountdownTimer !== null) {
+    clearInterval(paymentCountdownTimer);
+    paymentCountdownTimer = null;
+  }
+  paymentCountdownExpiresAt = null;
+}
+
+function paymentExpirationMessage(expiresAt) {
+  if (!expiresAt) return '';
+  const expiration = new Date(expiresAt);
+  if (Number.isNaN(expiration.getTime())) return '';
+  const formatted = new Intl.DateTimeFormat('pt-BR', {
+    dateStyle: 'short',
+    timeStyle: 'short'
+  }).format(expiration);
+  return `Este PIX pode ser pago até ${formatted}.`;
+}
+
+function updatePaymentCountdown() {
+  if (!paymentCountdownExpiresAt) return;
+  const remainingSeconds = Math.max(
+    0,
+    Math.ceil((paymentCountdownExpiresAt.getTime() - Date.now()) / 1000)
+  );
+  const minutes = String(Math.floor(remainingSeconds / 60)).padStart(2, '0');
+  const seconds = String(remainingSeconds % 60).padStart(2, '0');
+  el('payment-status-label').textContent = remainingSeconds > 0
+    ? `Aguardando pagamento · ${minutes}:${seconds}`
+    : 'Prazo encerrado · finalizando...';
+  if (remainingSeconds === 0) refreshPaymentStatus();
+}
+
+function startPaymentCountdown(expiresAt) {
+  if (!expiresAt) {
+    stopPaymentCountdown();
+    return;
+  }
+  const expiration = new Date(expiresAt);
+  if (Number.isNaN(expiration.getTime())) {
+    stopPaymentCountdown();
+    return;
+  }
+  if (
+    paymentCountdownTimer !== null
+    && paymentCountdownExpiresAt?.getTime() === expiration.getTime()
+  ) {
+    updatePaymentCountdown();
+    return;
+  }
+  stopPaymentCountdown();
+  paymentCountdownExpiresAt = expiration;
+  updatePaymentCountdown();
+  paymentCountdownTimer = setInterval(updatePaymentCountdown, 1000);
+}
+
+function setPaymentDisplay(variant, label, message = '') {
+  const status = el('payment-status');
+  status.classList.remove('expired', 'failed', 'cancelled');
+  if (variant !== 'waiting') status.classList.add(variant);
+  el('payment-status-label').textContent = label;
+
+  const paymentMessage = el('payment-message');
+  paymentMessage.textContent = message;
+  paymentMessage.classList.toggle('hidden', !message);
+
+  const terminal = ['expired', 'failed', 'cancelled'].includes(variant);
+  el('copy-pix').disabled = terminal;
+  el('cancel-payment').classList.toggle('hidden', terminal);
+}
+
+function applyOrderPaymentStatus(order) {
+  state.order = order;
+
+  if (order.status === 'PAID' || order.payment.status === 'APPROVED') {
+    stopPaymentPolling();
+    renderSuccess();
+    show('success');
+    return true;
+  }
+
+  if (order.payment.status === 'EXPIRED') {
+    stopPaymentPolling();
+    setPaymentDisplay(
+      'expired',
+      'Prazo do PIX encerrado',
+      'Este pedido ficou pendente. Procure o time de Gente & Gestão para regularizar.'
+    );
+    return true;
+  }
+
+  if (order.payment.status === 'FAILED') {
+    stopPaymentPolling();
+    setPaymentDisplay(
+      'failed',
+      'Pagamento não gerado',
+      'A reserva foi liberada. Volte e faça um novo pedido.'
+    );
+    return true;
+  }
+
+  if (order.status === 'CANCELLED' || order.payment.status === 'CANCELLED') {
+    stopPaymentPolling();
+    setPaymentDisplay(
+      'cancelled',
+      'Pagamento cancelado',
+      'A cobrança foi interrompida e os produtos voltaram a ficar disponíveis.'
+    );
+    return true;
+  }
+
+  setPaymentDisplay(
+    'waiting',
+    'Aguardando pagamento',
+    paymentExpirationMessage(order.payment.expires_at)
+  );
+  startPaymentCountdown(order.payment.expires_at);
+  return false;
+}
+
+async function refreshPaymentStatus(session = paymentPollSession) {
+  if (!state.order || paymentPollInFlight) return;
+  const orderId = state.order.id;
+  paymentPollInFlight = true;
+  try {
+    const order = await api(`/api/orders/${encodeURIComponent(orderId)}`);
+    if (state.order?.id === orderId && session === paymentPollSession) {
+      applyOrderPaymentStatus(order);
+    }
+  } catch {
+    if (state.order?.id === orderId && session === paymentPollSession) {
+      setPaymentDisplay(
+        'waiting',
+        'Verificando pagamento',
+        'A confirmação está demorando. Esta página continuará tentando.'
+      );
+    }
+  } finally {
+    paymentPollInFlight = false;
+  }
+}
+
+function startPaymentPolling() {
+  stopPaymentPolling();
+  if (!state.order || applyOrderPaymentStatus(state.order)) return;
+  const session = paymentPollSession;
+  paymentPollTimer = setInterval(
+    () => refreshPaymentStatus(session),
+    PAYMENT_POLL_INTERVAL_MS
+  );
+  refreshPaymentStatus(session);
+}
+
 el('buyer-name').addEventListener('input', () => validateForm(false));
 el('buyer-name').addEventListener('blur', () => validName(true));
 
@@ -216,6 +386,7 @@ el('order-form').addEventListener('submit', async event => {
     el('payment-total').textContent = money(state.order.total);
     el('simulate-payment').classList.toggle('hidden', !state.order.payment.simulated);
     show('payment');
+    startPaymentPolling();
   } catch (error) {
     toast(error.message);
     await loadProducts().catch(() => {});
@@ -242,8 +413,7 @@ el('simulate-payment').addEventListener('click', async () => {
     button.disabled = true;
     button.textContent = 'Confirmando...';
     await api(`/api/mock/pay/${state.order.payment.txid}`, { method: 'POST' });
-    renderSuccess();
-    show('success');
+    await refreshPaymentStatus();
   } catch (error) {
     toast(error.message);
     button.disabled = false;
@@ -251,8 +421,43 @@ el('simulate-payment').addEventListener('click', async () => {
   }
 });
 
-el('back-shop').addEventListener('click', () => show('shop'));
+async function cancelCurrentPayment() {
+  if (!state.order || paymentCancelling) return;
+  const confirmed = window.confirm(
+    'Deseja cancelar este pagamento? A cobrança será interrompida e a reserva será liberada.'
+  );
+  if (!confirmed) return;
+
+  paymentCancelling = true;
+  const button = el('cancel-payment');
+  button.disabled = true;
+  button.textContent = 'Cancelando...';
+  try {
+    state.order = await api(
+      `/api/orders/${encodeURIComponent(state.order.id)}/cancel`,
+      { method: 'POST' }
+    );
+    stopPaymentPolling();
+    state.cart = {};
+    state.order = null;
+    el('order-form').reset();
+    show('shop');
+    toast('Pagamento cancelado e estoque liberado.');
+    await loadProducts().catch(error => toast(error.message));
+  } catch (error) {
+    toast(error.message);
+    await refreshPaymentStatus();
+  } finally {
+    paymentCancelling = false;
+    button.disabled = false;
+    button.textContent = 'Cancelar pagamento';
+  }
+}
+
+el('cancel-payment').addEventListener('click', cancelCurrentPayment);
+el('back-shop').addEventListener('click', cancelCurrentPayment);
 el('new-order').addEventListener('click', async () => {
+  stopPaymentPolling();
   state.cart = {};
   state.order = null;
   el('order-form').reset();

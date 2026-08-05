@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import httpx
@@ -23,6 +24,7 @@ def mercadopago_settings(
     access_token: str = "TEST-ACCESS-TOKEN",
     webhook_secret: str = "test-webhook-secret",
     test_payer_first_name: str | None = None,
+    test_payer_email: str | None = None,
 ) -> Settings:
     return Settings(
         mercadopago_access_token=access_token,
@@ -30,6 +32,7 @@ def mercadopago_settings(
         payment_provider="mercadopago",
         charge_expires_in=1800,
         mercadopago_test_payer_first_name=test_payer_first_name,
+        mercadopago_test_payer_email=test_payer_email,
     )
 
 
@@ -107,9 +110,11 @@ def test_create_charge_sends_correct_payload_auth_and_idempotency_key():
     assert result.qr_code == "https://example.test/pix/order-123"
     assert result.copy_paste == "PIX-COPIA-E-COLA"
     assert result.amount == Decimal("16.00")
+    remaining = (result.expires_at - datetime.now(UTC)).total_seconds()
+    assert 590 <= remaining <= 600
 
 
-def test_create_charge_includes_test_payer_first_name_only_when_configured():
+def test_create_charge_includes_test_payer_fields_only_when_configured():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -145,7 +150,10 @@ def test_create_charge_includes_test_payer_first_name_only_when_configured():
             base_url="https://api.mercadopago.com",
         )
         provider = MercadoPagoProvider(
-            mercadopago_settings(test_payer_first_name="APRO"),
+            mercadopago_settings(
+                test_payer_first_name="APRO",
+                test_payer_email="test_user_br@testuser.com",
+            ),
             client=client,
         )
         try:
@@ -155,7 +163,7 @@ def test_create_charge_includes_test_payer_first_name_only_when_configured():
 
     asyncio.run(scenario())
     assert captured["payload"]["payer"] == {
-        "email": MERCADOPAGO_FALLBACK_PAYER_EMAIL,
+        "email": "test_user_br@testuser.com",
         "first_name": "APRO",
     }
 
@@ -191,6 +199,56 @@ def test_create_charge_reports_provider_http_error():
 
     with pytest.raises(PaymentProviderError, match="invalid payer data"):
         run_with_provider(handler, create)
+
+
+def test_cancel_order_sends_stable_idempotency_key():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return httpx.Response(200, json={"id": "ORD123", "status": "cancelled"})
+
+    async def cancel(provider):
+        await provider.cancel_order("ORD123", "redbull-order-local-cancel")
+
+    run_with_provider(handler, cancel)
+    request = captured["request"]
+    assert request.method == "POST"
+    assert request.url.path == "/v1/orders/ORD123/cancel"
+    assert request.headers["Authorization"] == "Bearer TEST-ACCESS-TOKEN"
+    assert request.headers["X-Idempotency-Key"] == (
+        "redbull-order-local-cancel"
+    )
+
+
+def test_cancel_order_accepts_already_cancelled_response_as_idempotent():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={
+                "errors": [{"code": "order_already_canceled"}],
+                "message": "Order already canceled",
+            },
+        )
+
+    async def cancel(provider):
+        await provider.cancel_order("ORD123", "cancel-key")
+
+    run_with_provider(handler, cancel)
+
+
+def test_cancel_order_reports_provider_error():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"code": "cannot_cancel_order", "message": "already paid"},
+        )
+
+    async def cancel(provider):
+        await provider.cancel_order("ORD123", "cancel-key")
+
+    with pytest.raises(PaymentProviderError, match="already paid"):
+        run_with_provider(handler, cancel)
 
 
 def test_create_charge_rejects_response_without_pix_code():
@@ -255,7 +313,7 @@ def test_factory_does_not_fallback_to_mock_when_provider_is_missing(monkeypatch)
         create_payment_provider(settings)
 
 
-def test_get_payment_queries_by_payment_id():
+def test_get_order_queries_by_order_id_and_maps_accredited_payment():
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -263,25 +321,40 @@ def test_get_payment_queries_by_payment_id():
         return httpx.Response(
             200,
             json={
-                "id": 456,
-                "status": "approved",
-                "transaction_amount": 16,
-                "currency_id": "BRL",
-                "date_approved": "2026-08-04T20:00:00Z",
+                "id": "ORDTST123",
+                "status": "processed",
+                "status_detail": "accredited",
+                "total_amount": "16.00",
+                "total_paid_amount": "16.00",
+                "currency": "BRL",
+                "last_updated_date": "2026-08-04T20:00:00Z",
+                "transactions": {
+                    "payments": [
+                        {
+                            "id": "PAY123",
+                            "amount": "16.00",
+                            "paid_amount": "16.00",
+                            "status": "processed",
+                            "status_detail": "accredited",
+                        }
+                    ]
+                },
             },
         )
 
-    async def get_payment(provider):
-        return await provider.get_payment("456")
+    async def get_order(provider):
+        return await provider.get_order("ORDTST123")
 
-    result = run_with_provider(handler, get_payment)
-    assert captured["request"].url.path == "/v1/payments/456"
+    result = run_with_provider(handler, get_order)
+    assert captured["request"].url.path == "/v1/orders/ORDTST123"
     assert captured["request"].headers["Authorization"] == (
         "Bearer TEST-ACCESS-TOKEN"
     )
-    assert result.provider_payment_id == "456"
+    assert result.provider_order_id == "ORDTST123"
+    assert result.provider_payment_id == "PAY123"
     assert result.status == "APPROVED"
     assert result.amount == Decimal("16")
+    assert result.approved_at == datetime(2026, 8, 4, 20, 0, tzinfo=UTC)
 
 
 def test_verify_mercadopago_signature_uses_official_manifest():

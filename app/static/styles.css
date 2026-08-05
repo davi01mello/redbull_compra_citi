@@ -154,9 +154,16 @@ h1 span { color: var(--green); }
 .payment-summary strong { color: var(--text); font-size: 20px; }
 .status-pill { display: flex; align-items: center; justify-content: center; gap: 9px; min-height: 52px; padding: 10px 16px; border: 1px solid var(--green); border-radius: 26px; color: var(--green); font-size: 14px; font-weight: 700; }
 .status-pill svg { width: 23px; }
+.status-pill.expired { border-color: #f4b942; color: #f4b942; }
+.status-pill.failed { border-color: var(--error); color: var(--error); }
+.status-pill.cancelled { border-color: var(--muted); color: var(--muted); }
+.payment-message { margin: 10px 8px 0; color: var(--muted); font-size: 12px; line-height: 1.45; text-align: center; }
 .outline-button { display: flex; align-items: center; justify-content: center; gap: 11px; width: 100%; min-height: 54px; margin-top: 12px; padding: 10px 16px; border: 1px solid #526174; border-radius: 16px; background: var(--surface); color: var(--text); font-weight: 600; cursor: pointer; }
 .outline-button:hover { border-color: var(--green); }
+.outline-button:disabled { opacity: .5; cursor: not-allowed; }
 .outline-button svg { width: 21px; }
+.cancel-payment-button { min-height: 46px; border-color: rgba(255, 92, 92, .55); background: transparent; color: #ff8585; }
+.cancel-payment-button:hover { border-color: var(--error); }
 .demo-box { display: flex; align-items: center; gap: 10px; margin-top: 16px; padding: 12px; border: 1px dashed var(--border); border-radius: 15px; background: rgba(16,26,38,.5); }
 .demo-box div { flex: 1; min-width: 0; }
 .demo-box strong, .demo-box small { display: block; }

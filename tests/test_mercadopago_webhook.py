@@ -57,7 +57,8 @@ class MercadoPagoWebhookTestProvider:
     provider_name = "mercadopago"
 
     def __init__(self) -> None:
-        self.payment_results: dict[str, PaymentResult] = {}
+        self.order_results: dict[str, PaymentResult] = {}
+        self.order_ids_by_payment_id: dict[str, str] = {}
         self.queries: list[str] = []
 
     async def create_charge(
@@ -66,16 +67,19 @@ class MercadoPagoWebhookTestProvider:
         amount: Decimal,
         idempotency_key: str,
     ) -> ChargeResult:
+        order_id = f"mp-order-{external_reference}"
         payment_id = f"mp-payment-{external_reference}"
-        self.payment_results[payment_id] = PaymentResult(
+        self.order_results[order_id] = PaymentResult(
+            provider_order_id=order_id,
             provider_payment_id=payment_id,
             status="PENDING",
             amount=amount,
             currency="BRL",
             approved_at=None,
         )
+        self.order_ids_by_payment_id[payment_id] = order_id
         return ChargeResult(
-            provider_order_id=f"mp-order-{external_reference}",
+            provider_order_id=order_id,
             provider_payment_id=payment_id,
             qr_code=f"https://example.test/pix/{external_reference}",
             copy_paste=f"PIX-{external_reference}",
@@ -83,12 +87,15 @@ class MercadoPagoWebhookTestProvider:
             expires_at=datetime.now(UTC) + timedelta(minutes=30),
         )
 
-    async def get_payment(self, payment_id: str) -> PaymentResult:
-        self.queries.append(payment_id)
+    async def get_order(self, order_id: str) -> PaymentResult:
+        self.queries.append(order_id)
         try:
-            return self.payment_results[payment_id]
+            return self.order_results[order_id]
         except KeyError as exc:
-            raise PaymentProviderError("Pagamento de teste não encontrado") from exc
+            raise PaymentProviderError("Order de teste não encontrada") from exc
+
+    def order_id_for_payment(self, payment_id: str) -> str:
+        return self.order_ids_by_payment_id[payment_id]
 
     async def aclose(self) -> None:
         return None
@@ -110,9 +117,9 @@ async def create_pending_order(provider: MercadoPagoWebhookTestProvider):
     return order
 
 
-def signature_headers(payment_id: str, request_id: str = "request-stage-7") -> dict:
+def signature_headers(order_id: str, request_id: str = "request-stage-7") -> dict:
     timestamp = "1785879000"
-    normalized_id = payment_id.lower() if payment_id.isalnum() else payment_id
+    normalized_id = order_id.lower() if order_id.isalnum() else order_id
     manifest = f"id:{normalized_id};request-id:{request_id};ts:{timestamp};"
     digest = hmac.new(
         WEBHOOK_SECRET.encode(), manifest.encode(), hashlib.sha256
@@ -123,12 +130,12 @@ def signature_headers(payment_id: str, request_id: str = "request-stage-7") -> d
     }
 
 
-def webhook_body(event_id: str, payment_id: str) -> dict:
+def webhook_body(event_id: str, order_id: str) -> dict:
     return {
         "id": event_id,
-        "type": "payment",
-        "action": "payment.updated",
-        "data": {"id": payment_id},
+        "type": "order",
+        "action": "order.updated",
+        "data": {"id": order_id},
     }
 
 
@@ -141,14 +148,14 @@ def webhook_settings() -> Settings:
     )
 
 
-def post_webhook(provider, event_id, payment_id, headers=None):
+def post_webhook(provider, event_id, order_id, headers=None):
     with TestClient(app) as client:
         client.app.state.payment_provider = provider
         client.app.state.payment_settings = webhook_settings()
         return client.post(
             "/api/webhooks/mercadopago",
-            json=webhook_body(event_id, payment_id),
-            headers=headers or signature_headers(payment_id),
+            json=webhook_body(event_id, order_id),
+            headers=headers or signature_headers(order_id),
         )
 
 
@@ -184,10 +191,23 @@ async def load_state(order_id):
     return result
 
 
-def approve(provider, payment_id):
-    current = provider.payment_results[payment_id]
-    provider.payment_results[payment_id] = PaymentResult(
-        provider_payment_id=payment_id,
+async def load_event_references(event_id: str) -> tuple[str | None, str | None]:
+    async with AsyncSessionLocal() as session:
+        event = (
+            await session.execute(
+                select(WebhookEventORM).where(WebhookEventORM.event_id == event_id)
+            )
+        ).scalar_one()
+        result = (event.provider_order_id, event.provider_payment_id)
+    await engine.dispose()
+    return result
+
+
+def approve(provider, order_id):
+    current = provider.order_results[order_id]
+    provider.order_results[order_id] = PaymentResult(
+        provider_order_id=order_id,
+        provider_payment_id=current.provider_payment_id,
         status="APPROVED",
         amount=current.amount,
         currency="BRL",
@@ -198,16 +218,20 @@ def approve(provider, payment_id):
 def test_valid_signature_and_approved_payment_marks_paid_and_consumes_stock():
     provider = MercadoPagoWebhookTestProvider()
     order = asyncio.run(create_pending_order(provider))
-    payment_id = order.payment.txid
-    approve(provider, payment_id)
+    order_id = provider.order_id_for_payment(order.payment.txid)
+    approve(provider, order_id)
 
-    response = post_webhook(provider, "event-approved", payment_id)
+    response = post_webhook(provider, "event-approved", order_id)
     asyncio.run(engine.dispose())
     state = asyncio.run(load_state(order.id))
 
     assert response.status_code == 200
     assert response.json()["outcome"] == "approved"
-    assert provider.queries == [payment_id]
+    assert provider.queries == [order_id]
+    assert asyncio.run(load_event_references("event-approved")) == (
+        order_id,
+        order.payment.txid,
+    )
     assert state == (
         OrderStatus.PAID,
         ReservationStatus.CONSUMED,
@@ -223,12 +247,12 @@ def test_valid_signature_and_approved_payment_marks_paid_and_consumes_stock():
 def test_invalid_signature_is_rejected_without_querying_or_changing_state():
     provider = MercadoPagoWebhookTestProvider()
     order = asyncio.run(create_pending_order(provider))
-    payment_id = order.payment.txid
+    order_id = provider.order_id_for_payment(order.payment.txid)
 
     response = post_webhook(
         provider,
         "event-invalid-signature",
-        payment_id,
+        order_id,
         headers={"x-request-id": "request", "x-signature": "ts=1,v1=invalid"},
     )
     asyncio.run(engine.dispose())
@@ -245,12 +269,12 @@ def test_invalid_signature_is_rejected_without_querying_or_changing_state():
 def test_duplicate_webhook_does_not_decrement_stock_twice():
     provider = MercadoPagoWebhookTestProvider()
     order = asyncio.run(create_pending_order(provider))
-    payment_id = order.payment.txid
-    approve(provider, payment_id)
+    order_id = provider.order_id_for_payment(order.payment.txid)
+    approve(provider, order_id)
 
-    first = post_webhook(provider, "event-duplicate", payment_id)
+    first = post_webhook(provider, "event-duplicate", order_id)
     asyncio.run(engine.dispose())
-    second = post_webhook(provider, "event-duplicate", payment_id)
+    second = post_webhook(provider, "event-duplicate", order_id)
     asyncio.run(engine.dispose())
     state = asyncio.run(load_state(order.id))
 
@@ -265,17 +289,18 @@ def test_duplicate_webhook_does_not_decrement_stock_twice():
 def test_non_approved_payment_is_acknowledged_without_state_change(status):
     provider = MercadoPagoWebhookTestProvider()
     order = asyncio.run(create_pending_order(provider))
-    payment_id = order.payment.txid
-    current = provider.payment_results[payment_id]
-    provider.payment_results[payment_id] = PaymentResult(
-        provider_payment_id=payment_id,
+    order_id = provider.order_id_for_payment(order.payment.txid)
+    current = provider.order_results[order_id]
+    provider.order_results[order_id] = PaymentResult(
+        provider_order_id=order_id,
+        provider_payment_id=current.provider_payment_id,
         status=status,
         amount=current.amount,
         currency="BRL",
         approved_at=None,
     )
 
-    response = post_webhook(provider, f"event-{status.lower()}", payment_id)
+    response = post_webhook(provider, f"event-{status.lower()}", order_id)
     asyncio.run(engine.dispose())
     state = asyncio.run(load_state(order.id))
 
@@ -287,19 +312,20 @@ def test_non_approved_payment_is_acknowledged_without_state_change(status):
     assert state[5:] == (INITIAL_STOCK["original"], 2, 1)
 
 
-def test_unknown_payment_id_is_acknowledged_and_logged():
+def test_unknown_order_id_is_acknowledged_and_logged():
     asyncio.run(reset_database())
     provider = MercadoPagoWebhookTestProvider()
-    payment_id = "unknown-payment-id"
-    provider.payment_results[payment_id] = PaymentResult(
-        provider_payment_id=payment_id,
+    order_id = "unknown-order-id"
+    provider.order_results[order_id] = PaymentResult(
+        provider_order_id=order_id,
+        provider_payment_id="unknown-payment-id",
         status="APPROVED",
         amount=Decimal("8.50"),
         currency="BRL",
         approved_at=APPROVED_AT,
     )
 
-    response = post_webhook(provider, "event-unknown", payment_id)
+    response = post_webhook(provider, "event-unknown", order_id)
     asyncio.run(engine.dispose())
 
     async def event_count():
@@ -313,14 +339,14 @@ def test_unknown_payment_id_is_acknowledged_and_logged():
         return count
 
     assert response.status_code == 200
-    assert response.json()["outcome"] == "unknown_payment"
+    assert response.json()["outcome"] == "unknown_order"
     assert asyncio.run(event_count()) == 1
 
 
 def test_released_reservation_is_flagged_without_decrementing_stock():
     provider = MercadoPagoWebhookTestProvider()
     order = asyncio.run(create_pending_order(provider))
-    payment_id = order.payment.txid
+    order_id = provider.order_id_for_payment(order.payment.txid)
 
     async def release():
         async with AsyncSessionLocal() as session:
@@ -335,8 +361,8 @@ def test_released_reservation_is_flagged_without_decrementing_stock():
         await engine.dispose()
 
     asyncio.run(release())
-    approve(provider, payment_id)
-    response = post_webhook(provider, "event-released", payment_id)
+    approve(provider, order_id)
+    response = post_webhook(provider, "event-released", order_id)
     asyncio.run(engine.dispose())
     state = asyncio.run(load_state(order.id))
 
@@ -352,17 +378,17 @@ def test_two_concurrent_webhooks_decrement_stock_only_once():
     async def scenario():
         provider = MercadoPagoWebhookTestProvider()
         order = await create_pending_order(provider)
-        payment_id = order.payment.txid
-        approve(provider, payment_id)
-        provider_payment = provider.payment_results[payment_id]
+        order_id = provider.order_id_for_payment(order.payment.txid)
+        approve(provider, order_id)
+        provider_payment = provider.order_results[order_id]
 
         async def process(event_id):
             async with AsyncSessionLocal() as session:
                 return await process_mercadopago_payment(
                     session,
                     event_id=event_id,
-                    event_type="payment.updated",
-                    webhook_payment_id=payment_id,
+                    event_type="order.updated",
+                    webhook_order_id=order_id,
                     provider_payment=provider_payment,
                 )
 

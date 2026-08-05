@@ -81,8 +81,10 @@ def _order_to_model(order: OrderORM) -> Order:
         paid_at=order.paid_at,
         payment=PaymentData(
             txid=payment_reference,
-            qr_code=payment.qr_code,
+            qr_code=f"/api/orders/{order.id}/qr",
             copy_paste=payment.copy_paste,
+            status=payment.status,
+            expires_at=payment.expires_at,
             simulated=payment.provider == PaymentProvider.MOCK,
         ),
     )
