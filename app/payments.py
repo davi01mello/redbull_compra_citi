@@ -146,6 +146,9 @@ class MercadoPagoProvider:
         expires_at = datetime.now(UTC) + timedelta(
             seconds=self.settings.charge_expires_in
         )
+        payer = {"email": MERCADOPAGO_FALLBACK_PAYER_EMAIL}
+        if self.settings.mercadopago_test_payer_first_name:
+            payer["first_name"] = self.settings.mercadopago_test_payer_first_name
         payload = {
             "type": "online",
             "total_amount": amount_text,
@@ -163,7 +166,7 @@ class MercadoPagoProvider:
                     }
                 ]
             },
-            "payer": {"email": MERCADOPAGO_FALLBACK_PAYER_EMAIL},
+            "payer": payer,
         }
         try:
             response = await self._client.post(

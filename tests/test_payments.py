@@ -22,12 +22,14 @@ def mercadopago_settings(
     *,
     access_token: str = "TEST-ACCESS-TOKEN",
     webhook_secret: str = "test-webhook-secret",
+    test_payer_first_name: str | None = None,
 ) -> Settings:
     return Settings(
         mercadopago_access_token=access_token,
         mercadopago_webhook_secret=webhook_secret,
         payment_provider="mercadopago",
         charge_expires_in=1800,
+        mercadopago_test_payer_first_name=test_payer_first_name,
     )
 
 
@@ -105,6 +107,57 @@ def test_create_charge_sends_correct_payload_auth_and_idempotency_key():
     assert result.qr_code == "https://example.test/pix/order-123"
     assert result.copy_paste == "PIX-COPIA-E-COLA"
     assert result.amount == Decimal("16.00")
+
+
+def test_create_charge_includes_test_payer_first_name_only_when_configured():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            201,
+            json={
+                "id": "order-apro",
+                "transactions": {
+                    "payments": [
+                        {
+                            "id": "payment-apro",
+                            "payment_method": {
+                                "qr_code": "PIX-APRO",
+                                "ticket_url": "https://example.test/pix/apro",
+                            },
+                        }
+                    ]
+                },
+            },
+        )
+
+    async def create(provider):
+        return await provider.create_charge(
+            external_reference="order-test-apro",
+            amount=Decimal("8.50"),
+            idempotency_key="charge-test-apro",
+        )
+
+    async def scenario():
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="https://api.mercadopago.com",
+        )
+        provider = MercadoPagoProvider(
+            mercadopago_settings(test_payer_first_name="APRO"),
+            client=client,
+        )
+        try:
+            await create(provider)
+        finally:
+            await provider.aclose()
+
+    asyncio.run(scenario())
+    assert captured["payload"]["payer"] == {
+        "email": MERCADOPAGO_FALLBACK_PAYER_EMAIL,
+        "first_name": "APRO",
+    }
 
 
 def test_create_charge_rejects_invalid_provider_response():

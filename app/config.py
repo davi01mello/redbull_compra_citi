@@ -16,6 +16,7 @@ class Settings:
     payment_provider: str
     charge_expires_in: int
     payment_expiration_check_interval: int = 60
+    mercadopago_test_payer_first_name: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -41,6 +42,9 @@ class Settings:
             payment_provider=os.getenv("PAYMENT_PROVIDER", "").strip().lower(),
             charge_expires_in=charge_expires_in,
             payment_expiration_check_interval=payment_expiration_check_interval,
+            mercadopago_test_payer_first_name=(
+                os.getenv("MERCADOPAGO_TEST_PAYER_FIRST_NAME", "").strip() or None
+            ),
         )
 
     def validate(self) -> None:
