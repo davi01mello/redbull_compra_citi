@@ -43,7 +43,9 @@ def client():
 
 def test_health_and_products(client):
     assert client.get("/api/health").json()["storage"] == "postgresql"
-    assert len(client.get("/api/products").json()) == 3
+    products = client.get("/api/products").json()
+    assert len(products) == 3
+    assert all(product["price"] == 8.5 for product in products)
     member_tiers = client.get(
         "/api/price-tiers", params={"pricing_audience": "MEMBER"}
     ).json()

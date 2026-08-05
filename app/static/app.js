@@ -394,7 +394,6 @@ el('order-form').addEventListener('submit', async event => {
     setSubmitting(false);
   }
 });
-
 el('copy-pix').addEventListener('click', async () => {
   try {
     await navigator.clipboard.writeText(el('pix-code').textContent);

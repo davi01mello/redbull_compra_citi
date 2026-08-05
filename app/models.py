@@ -121,4 +121,3 @@ class ManualReview(BaseModel):
     details: str | None
     created_at: datetime
     resolved_at: datetime | None
-

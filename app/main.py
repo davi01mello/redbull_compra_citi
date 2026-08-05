@@ -276,4 +276,3 @@ def mock_qr(txid: str, request: Request) -> Response:
     safe = txid.replace("<", "").replace(">", "")
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240" viewBox="0 0 240 240"><rect width="240" height="240" rx="18" fill="white"/><g fill="#071d49"><rect x="24" y="24" width="64" height="64"/><rect x="152" y="24" width="64" height="64"/><rect x="24" y="152" width="64" height="64"/><path d="M110 24h20v42h-20zM108 86h52v20h-32v22h-20zM96 142h24v22h20v52H98v-22h20v-30H96zM154 128h62v20h-42v22h42v46h-22v-24h-42v-42h22z"/></g><text x="120" y="122" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#e21b2d">PIX MVP</text><title>{safe}</title></svg>'''
     return Response(svg, media_type="image/svg+xml")
-

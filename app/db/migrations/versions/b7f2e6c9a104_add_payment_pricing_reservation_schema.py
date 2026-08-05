@@ -39,6 +39,7 @@ payment_status_enum = postgresql.ENUM(
     "APPROVED",
     "EXPIRED",
     "FAILED",
+    "CANCELLED",
     name="payment_status",
     create_type=False,
 )
@@ -230,6 +231,42 @@ def upgrade() -> None:
             """
         )
     )
+
+    order_columns = {
+        column["name"] for column in sa.inspect(bind).get_columns("orders")
+    }
+    if "pending_items" in order_columns:
+        op.execute(
+            sa.text(
+                """
+                INSERT INTO order_items (
+                    order_id,
+                    product_id,
+                    product_name,
+                    quantity,
+                    unit_price,
+                    subtotal
+                )
+                SELECT
+                    legacy_order.id,
+                    item->>'product_id',
+                    item->>'product_name',
+                    (item->>'quantity')::integer,
+                    (item->>'unit_price')::numeric(10, 2),
+                    (item->>'subtotal')::numeric(10, 2)
+                FROM orders AS legacy_order
+                CROSS JOIN LATERAL json_array_elements(
+                    COALESCE(legacy_order.pending_items, '[]'::json)
+                ) AS item
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM order_items AS existing_item
+                    WHERE existing_item.order_id = legacy_order.id
+                )
+                """
+            )
+        )
+
     op.execute(
         sa.text(
             """
@@ -288,13 +325,20 @@ def upgrade() -> None:
     payment_rows = []
     for order in existing_orders:
         approved = order["status"] == "PAID"
+        cancelled = order["status"] == "CANCELLED"
         created_at = order["created_at"] or now
         payment_rows.append(
             {
                 "id": uuid4(),
                 "order_id": order["id"],
                 "provider": "MOCK",
-                "status": "APPROVED" if approved else "WAITING_PAYMENT",
+                "status": (
+                    "APPROVED"
+                    if approved
+                    else "CANCELLED"
+                    if cancelled
+                    else "WAITING_PAYMENT"
+                ),
                 "amount": order["total"],
                 "currency": "BRL",
                 "copy_paste": order["copy_paste"],
