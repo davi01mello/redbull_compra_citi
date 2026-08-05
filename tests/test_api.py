@@ -194,7 +194,7 @@ def test_order_uses_progressive_price(client, quantity, unit_price, total):
     assert isinstance(order["price_tier_id"], int)
 
 
-@pytest.mark.parametrize(("quantity", "total"), [(1, 12.0), (5, 60.0)])
+@pytest.mark.parametrize(("quantity", "total"), [(1, 12.5), (5, 62.5)])
 def test_order_uses_fixed_non_member_price(client, quantity, total):
     response = client.post(
         "/api/orders",
@@ -207,7 +207,7 @@ def test_order_uses_fixed_non_member_price(client, quantity, total):
 
     assert response.status_code == 201
     order = response.json()
-    assert order["items"][0]["unit_price"] == 12.0
+    assert order["items"][0]["unit_price"] == 12.5
     assert order["total"] == total
     assert order["pricing_audience"] == "NON_MEMBER"
 
