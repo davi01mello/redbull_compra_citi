@@ -40,10 +40,8 @@ def _product_to_model(product: ProductORM) -> Product:
     return Product(
         id=product.id,
         name=product.name,
-        description=product.description,
-        color=product.color,
-        price=float(product.price),
         stock=product.stock - product.reserved_stock,
+        category=product.category,
     )
 
 

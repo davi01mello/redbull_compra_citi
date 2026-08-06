@@ -38,9 +38,22 @@ async function api(url, options = {}) {
   return response.json();
 }
 
+function normalizeId(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
 function productClass(product) {
-  if (product.id === 'tropical') return 'tropical';
-  if (product.id === 'melancia') return 'melancia';
+  const id = normalizeId(product.id);
+
+  if (id === 'tropical') return 'tropical';
+  if (id === 'melancia') return 'melancia';
+  if (id.includes('zero') || id.includes('tradicional')) return 'original';
+  if (id.includes('sugarfree')) return 'sugarfree';
   return 'original';
 }
 
@@ -48,9 +61,37 @@ function productImage(product) {
   const images = {
     tropical: '/static/assets/red-bull-tropical-transparent.png?v=20260802-2',
     melancia: '/static/assets/red-bull-melancia-transparent.png?v=20260802-2',
-    original: '/static/assets/red-bull-original-transparent.png?v=20260802-2'
+    original: '/static/assets/red-bull-original-transparent.png?v=20260802-2',
+    zero_tradicional: '/static/assets/redbull_tradicional_zero.png?v=20260806-2',
+    redbull_tradicional_zero: '/static/assets/redbull_tradicional_zero.png?v=20260806-2',
+    redbull_zero: '/static/assets/redbull_tradicional_zero.png?v=20260806-2',
+    nectarina: '/static/assets/nectarina.png?v=20260806-2',
+    nectarina_sugarfree: '/static/assets/nectarina_sugarfree-removebg.png?v=20260806-2',
+    pomelo_sugarfree: '/static/assets/pomelo_sugarfree-removebg-preview.png?v=20260806-2',
+    amora_sugarfree: '/static/assets/amora_sugarfree.png?v=20260806-2',
+    maca_sugarfree: '/static/assets/maça_sugarfree.png?v=20260806-2',
+    melao_e_maracuja: '/static/assets/Melão_e_maracuja.webp?v=20260806-2',
+    morango_e_pessego: '/static/assets/morango_e_pessego.webp?v=20260806-2',
+    sugarfree: '/static/assets/sugarfree-removebg.png?v=20260806-2',
+    tradicional_sugarfree: '/static/assets/sugarfree-removebg.png?v=20260806-2'
   };
-  return images[product.id] || images.original;
+
+  const id = normalizeId(product.id);
+  if (images[id]) return images[id];
+
+  const name = normalizeId(product.name);
+
+  if (name.includes('zero') || name.includes('tradicional')) return images.zero_tradicional;
+  if (name.includes('nectarina') && name.includes('sugarfree')) return images.nectarina_sugarfree;
+  if (name.includes('nectarina')) return images.nectarina;
+  if (name.includes('pomelo')) return images.pomelo_sugarfree;
+  if (name.includes('amora')) return images.amora_sugarfree;
+  if (name.includes('maca')) return images.maca_sugarfree;
+  if (name.includes('morango') || name.includes('pessego')) return images.morango_e_pessego;
+  if (name.includes('melao') || name.includes('maracuja')) return images.melao_e_maracuja;
+  if (name.includes('sugarfree')) return images.sugarfree;
+
+  return images.original;
 }
 
 function priceTierForQuantity(quantity) {

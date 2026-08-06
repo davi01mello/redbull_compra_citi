@@ -47,10 +47,8 @@ class ManualReviewReason(StrEnum):
 class Product(BaseModel):
     id: str
     name: str
-    description: str
-    color: str
-    price: float
     stock: int
+    category: str
 
 
 class OrderItemInput(BaseModel):

@@ -92,16 +92,19 @@ h1 span { color: var(--green); }
   width: 74px;
   height: 90px;
   overflow: hidden;
+  background: transparent;
 }
 .product-image img {
   position: absolute;
   top: 50%;
   left: 50%;
   display: block;
-  width: 100%;
-  height: 100%;
+  width: auto;
+  height: 84px;
+  max-width: 100%;
   object-fit: contain;
   transform: translate(-50%, -50%);
+  background: transparent;
   filter: drop-shadow(7px 8px 7px rgba(0, 0, 0, .38));
 }
 .product-copy { min-width: 0; }
