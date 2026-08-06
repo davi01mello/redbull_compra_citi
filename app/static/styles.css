@@ -92,6 +92,7 @@ h1 span { color: var(--green); }
   width: 74px;
   height: 90px;
   overflow: hidden;
+  background: transparent;
 }
 .product-image img {
   position: absolute;
@@ -103,6 +104,7 @@ h1 span { color: var(--green); }
   max-width: 100%;
   object-fit: contain;
   transform: translate(-50%, -50%);
+  background: transparent;
   filter: drop-shadow(7px 8px 7px rgba(0, 0, 0, .38));
 }
 .product-copy { min-width: 0; }
