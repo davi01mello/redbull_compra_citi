@@ -35,15 +35,18 @@ class ProductORM(Base):
 
     id: Mapped[str] = mapped_column(String(50), primary_key=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    color: Mapped[str] = mapped_column(String(20), nullable=False)
-    price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     stock: Mapped[int] = mapped_column(Integer, nullable=False)
     reserved_stock: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
         server_default=text("0"),
+    )
+    category: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="Regular",
+        server_default="Regular",
     )
 
 
