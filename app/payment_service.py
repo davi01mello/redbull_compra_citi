@@ -199,7 +199,7 @@ async def ensure_order_payment(
             amount=amount,
             idempotency_key=payment_idempotency_key(order_id),
         )
-        logger.info(
+        logger.warning(
         "Cobrança criada: order_id=%s provider_order_id=%s provider_payment_id=%s",
         order_id,
         charge.provider_order_id,
