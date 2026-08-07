@@ -200,10 +200,10 @@ async def ensure_order_payment(
             idempotency_key=payment_idempotency_key(order_id),
         )
         logger.info(
-            "Cobrança criada: order_id=%s provider_order_id=%s status=%s",
-            order_id,
-            charge.provider_order_id,
-            charge.status,
+        "Cobrança criada: order_id=%s provider_order_id=%s provider_payment_id=%s",
+        order_id,
+        charge.provider_order_id,
+        charge.provider_payment_id,
         )
         if charge.amount != amount:
             raise PaymentProviderError(
