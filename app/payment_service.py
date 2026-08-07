@@ -296,6 +296,12 @@ async def cancel_order_payment(
     except PaymentProviderError as exc:
         try:
             provider_payment = await provider.get_order(provider_order_id)
+            logger.info(
+            "Cobrança criada: order_id=%s provider_order_id=%s status=%s",
+            order_id,
+            payment.provider_order_id,
+            payment.status,
+            )
         except PaymentProviderError:
             provider_payment = None
         if provider_payment is not None and provider_payment.status.upper() == "APPROVED":
