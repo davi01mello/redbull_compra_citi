@@ -208,6 +208,11 @@ async def ensure_order_payment(
                 "O provedor não retornou todos os dados necessários do PIX"
             )
     except PaymentProviderError as exc:
+        logger.error(
+            "Falha ao criar cobrança no Mercado Pago: order_id=%s error=%s",
+            order_id,
+            exc,
+        )
         await store.release_reservation(
             db,
             order_id,
