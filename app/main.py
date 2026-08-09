@@ -18,7 +18,6 @@ from .models import (
     ManualReview,
     Order,
     OrderCreate,
-    MercadoPagoWebhookPayload,
     PriceTier,
     PricingAudience,
     Product,
@@ -189,70 +188,103 @@ async def manual_reviews(
 
 @app.post("/api/webhooks/mercadopago")
 async def mercadopago_webhook(
-    payload: MercadoPagoWebhookPayload,
     request: Request,
     x_signature: str | None = Header(None),
     x_request_id: str | None = Header(None),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    provider_order_id = str(payload.data.id)
-    webhook_secret = request.app.state.payment_settings.mercadopago_webhook_secret
+    # O Mercado Pago envia o ID da Order nos parâmetros da URL:
+    # ?data.id=ORD...&type=order
+    provider_order_id = request.query_params.get("data.id")
+
+    if not provider_order_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Parâmetro data.id não informado",
+        )
+
+    webhook_secret = (
+        request.app.state.payment_settings.mercadopago_webhook_secret
+    )
+
+    # A assinatura deve ser validada usando o data.id da URL.
     if not verify_mercadopago_signature(
         x_signature,
         x_request_id,
         provider_order_id,
         webhook_secret,
     ):
-        raise HTTPException(401, "Assinatura do webhook inválida")
+        raise HTTPException(
+            status_code=401,
+            detail="Assinatura do webhook inválida",
+        )
+
+    # O corpo serve apenas para obter informações adicionais.
+    # Ele não deve ser obrigatório para a rota funcionar.
+    try:
+        raw_payload = await request.json()
+    except ValueError:
+        raw_payload = {}
+
+    if not isinstance(raw_payload, dict):
+        raw_payload = {}
+
+    event_type = str(
+        raw_payload.get("action")
+        or raw_payload.get("type")
+        or request.query_params.get("type")
+        or "order.updated"
+    )
+
+    event_id = str(
+        raw_payload.get("id")
+        or x_request_id
+        or f"{event_type}:{provider_order_id}"
+    )
 
     try:
-        provider_payment = await request.app.state.payment_provider.get_order(
-            provider_order_id
+        provider_payment = (
+            await request.app.state.payment_provider.get_order(
+                provider_order_id
+            )
         )
     except PaymentProviderError as exc:
         logger.warning(
-            "Falha ao consultar order Mercado Pago provider_order_id=%s: %s",
+            "Falha ao consultar Order Mercado Pago "
+            "provider_order_id=%s: %s",
             provider_order_id,
             exc,
         )
-        raise HTTPException(503, "Não foi possível confirmar o pagamento") from exc
+        raise HTTPException(
+            status_code=503,
+            detail="Não foi possível confirmar o pagamento",
+        ) from exc
 
     result = await process_mercadopago_payment(
         db,
-        event_id=str(payload.id),
-        event_type=payload.action or payload.type,
+        event_id=event_id,
+        event_type=event_type,
         webhook_order_id=provider_order_id,
         provider_payment=provider_payment,
     )
-    if result.outcome in {"already_paid", "not_approved", "unknown_order"}:
-        logger.info(
-            "Webhook Mercado Pago reconhecido: outcome=%s provider_order_id=%s "
-            "order_id=%s",
-            result.outcome,
-            provider_order_id,
-            result.order_id,
-        )
-    elif not result.processed:
-        logger.warning(
-            "Webhook Mercado Pago não processado: outcome=%s "
-            "provider_order_id=%s order_id=%s",
-            result.outcome,
-            provider_order_id,
-            result.order_id,
-        )
-    elif result.outcome != "approved":
-        logger.info(
-            "Pagamento tardio Mercado Pago confirmado: outcome=%s "
-            "payment_id=%s order_id=%s",
-            result.outcome,
-            provider_payment.provider_payment_id,
-            result.order_id,
-        )
+
+    logger.info(
+        "Webhook Mercado Pago processado: "
+        "outcome=%s provider_order_id=%s order_id=%s",
+        result.outcome,
+        provider_order_id,
+        result.order_id,
+    )
+
     return {
         "received": True,
         "processed": result.processed,
         "outcome": result.outcome,
-        "order_id": str(result.order_id) if result.order_id else None,
+        "order_id": (
+            str(result.order_id)
+            if result.order_id
+            else None
+        ),
     }
 
 
