@@ -207,13 +207,7 @@ async def mercadopago_webhook(
         request.app.state.payment_settings.mercadopago_webhook_secret
     )
 
-    # A assinatura deve ser validada usando o data.id da URL.
-    if not verify_mercadopago_signature(
-        x_signature,
-        x_request_id,
-        provider_order_id,
-        webhook_secret,
-        logger.warning(
+    logger.warning(
         "Diagnóstico webhook: "
         "signature_present=%s request_id_present=%s "
         "data_id_present=%s secret_present=%s",
@@ -221,7 +215,14 @@ async def mercadopago_webhook(
         bool(x_request_id),
         bool(provider_order_id),
         bool(webhook_secret),
-        )
+    )
+
+    # A assinatura deve ser validada usando o data.id da URL.
+    if not verify_mercadopago_signature(
+        x_signature,
+        x_request_id,
+        provider_order_id,
+        webhook_secret,
     ):
         raise HTTPException(
             status_code=401,
