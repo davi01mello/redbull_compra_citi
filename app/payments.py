@@ -314,6 +314,11 @@ class MercadoPagoProvider:
         ):
             return
 
+        if response.status_code == 409:
+            raise PaymentProviderError(
+                f"Mercado Pago recusou o cancelamento: {response.text}"
+            )
+
         response.raise_for_status()
 
     async def aclose(self) -> None:
