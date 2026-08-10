@@ -213,6 +213,15 @@ async def mercadopago_webhook(
         x_request_id,
         provider_order_id,
         webhook_secret,
+        logger.warning(
+        "Diagnóstico webhook: "
+        "signature_present=%s request_id_present=%s "
+        "data_id_present=%s secret_present=%s",
+        bool(x_signature),
+        bool(x_request_id),
+        bool(provider_order_id),
+        bool(webhook_secret),
+        )
     ):
         raise HTTPException(
             status_code=401,
