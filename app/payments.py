@@ -296,32 +296,25 @@ class MercadoPagoProvider:
     async def cancel_order(self, order_id: str, idempotency_key: str) -> None:
         if not idempotency_key:
             raise PaymentProviderError("A chave de idempotência é obrigatória")
-        try:
-            response = await self._client.post(
-                f"/v1/orders/{order_id}/cancel",
-                headers={
-                    **self._headers,
-                    "X-Idempotency-Key": idempotency_key,
-                },
-            )
-            if response.status_code == 409 and self._error_code(response) == (
-                "order_already_canceled"
-            ):
-                return
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise PaymentProviderError(
-                "Tempo esgotado ao cancelar a order no Mercado Pago"
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            detail = self._error_detail(exc.response)
-            raise PaymentProviderError(
-                f"Mercado Pago recusou o cancelamento: {detail}"
-            ) from exc
-        except httpx.TransportError as exc:
-            raise PaymentProviderError(
-                "Falha de comunicação ao cancelar a order no Mercado Pago"
-            ) from exc
+        
+        response = await self._client.post(
+        f"/v1/orders/{order_id}/cancel",
+        headers={
+            **self._headers,
+            "X-Idempotency-Key": idempotency_key,
+            },
+        )
+
+        if response.status_code == 404:
+            return
+
+        if (
+            response.status_code == 409
+            and self._error_code(response) == "order_already_canceled"
+        ):
+            return
+
+        response.raise_for_status()
 
     async def aclose(self) -> None:
         await self._client.aclose()
