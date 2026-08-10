@@ -19,9 +19,11 @@ class Settings:
     payment_expiration_check_interval: int = 5
     mercadopago_test_payer_first_name: str | None = None
     mercadopago_test_payer_email: str | None = None
+    mercadopago_payer_email: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
+        
         raw_expiration = os.getenv("CHARGE_EXPIRES_IN", "1800")
         try:
             charge_expires_in = int(raw_expiration)
@@ -58,6 +60,9 @@ class Settings:
             ),
             mercadopago_test_payer_email=(
                 os.getenv("MERCADOPAGO_TEST_PAYER_EMAIL", "").strip() or None
+            ),
+            mercadopago_payer_email=(
+                os.getenv("MERCADOPAGO_PAYER_EMAIL", "").strip() or None
             ),
         )
 

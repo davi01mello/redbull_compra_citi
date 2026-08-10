@@ -13,7 +13,6 @@ from .config import Settings
 
 
 MERCADOPAGO_API_URL = "https://api.mercadopago.com"
-MERCADOPAGO_FALLBACK_PAYER_EMAIL = "vendas@citi.local"
 
 
 class PaymentProviderError(RuntimeError):
@@ -166,10 +165,17 @@ class MercadoPagoProvider:
         checkout_expires_at = now + timedelta(
             seconds=self.settings.payment_checkout_expires_in
         )
-        payer = {
-            "email": self.settings.mercadopago_test_payer_email
-            or MERCADOPAGO_FALLBACK_PAYER_EMAIL
-        }
+        payer_email = (
+            self.settings.mercadopago_test_payer_email
+            or self.settings.mercadopago_payer_email
+        )
+
+        if not payer_email:
+            raise PaymentProviderError(
+                "E-mail do pagador não configurado"
+            )
+
+        payer = {"email": payer_email}
         if self.settings.mercadopago_test_payer_first_name:
             payer["first_name"] = self.settings.mercadopago_test_payer_first_name
         payload = {
@@ -369,39 +375,33 @@ class MercadoPagoProvider:
             ),
         )
 
-    @staticmethod
-    def _error_detail(response: httpx.Response) -> str:
-        try:
-            data = response.json()
-        except ValueError:
-            return str(response.status_code)
-        if not isinstance(data, dict):
-            return str(response.status_code)
-        return str(
-            data.get("message")
-            or data.get("error")
-            or data.get("details")
-            or response.status_code
-        )
 
     @staticmethod
-    def _error_code(response: httpx.Response) -> str | None:
+    def _error_detail(response: httpx.Response) -> str:
+        parts = [f"status={response.status_code}"]
+
         try:
             data = response.json()
         except ValueError:
-            return None
+            body = response.text.strip()
+            if body:
+                parts.append(f"body={body[:500]}")
+            return " ".join(parts)
+
         if not isinstance(data, dict):
-            return None
-        code = data.get("code") or data.get("error")
-        if not code:
-            for key in ("errors", "details", "cause"):
-                entries = data.get(key)
-                if isinstance(entries, list) and entries:
-                    first = entries[0]
-                    if isinstance(first, dict) and first.get("code"):
-                        code = first["code"]
-                        break
-        return str(code) if code else None
+            return " ".join(parts)
+
+        for key in ("code", "message", "error", "status"):
+            value = data.get(key)
+            if value:
+                parts.append(f"{key}={value}")
+
+        for key in ("errors", "details", "cause"):
+            value = data.get(key)
+            if value:
+                parts.append(f"{key}={str(value)[:1000]}")
+
+        return " ".join(parts)
 
 
 def verify_mercadopago_signature(
