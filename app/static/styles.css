@@ -58,7 +58,7 @@ h1 span { color: var(--green); }
 .intro > p:last-child, .payment-heading > p:last-child { max-width: 330px; margin: 13px 0 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
 .pricing-summary { margin: -13px 0 25px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 
-.name-field label { display: inline-block; margin: 0 0 9px 2px; font-size: 14px; font-weight: 700; }
+.name-field label, .email-field label { display: inline-block; margin: 0 0 9px 2px; font-size: 14px; font-weight: 700; }
 .input-wrap { position: relative; }
 .input-wrap svg { position: absolute; top: 16px; left: 16px; width: 20px; color: var(--muted); }
 .input-wrap input {
@@ -70,7 +70,7 @@ h1 span { color: var(--green); }
 .input-wrap input::placeholder { color: #778393; }
 .input-wrap input:hover { border-color: #526174; }
 .input-wrap input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(50, 233, 104, .12); }
-.name-field.invalid input { border-color: var(--error); box-shadow: 0 0 0 3px rgba(255, 92, 92, .09); }
+.name-field.invalid input, .email-field.invalid input { border-color: var(--error); box-shadow: 0 0 0 3px rgba(255, 92, 92, .09); }
 .field-error { display: block; min-height: 19px; margin: 5px 2px 0; color: var(--error); font-size: 12px; }
 
 .section-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin: 17px 0 12px; }
@@ -126,19 +126,19 @@ h1 span { color: var(--green); }
 .total-row b { font-size: 14px; }
 .total-row small { color: var(--muted); font-size: 11px; }
 .total-row strong { font-size: 21px; letter-spacing: -.03em; }
-#checkout, .finish-button {
+#checkout, #email-submit, .finish-button {
   position: relative; display: flex; align-items: center; justify-content: center; gap: 10px;
   width: 100%; height: 56px; margin-top: 12px; padding: 0 18px;
   border: 0; border-radius: 16px; background: var(--green); color: #051009; font-weight: 800; cursor: pointer;
   transition: background .2s, transform .15s, opacity .2s;
 }
-#checkout svg { position: absolute; right: 17px; width: 23px; }
-#checkout:hover:not(:disabled) { background: #46f177; }
-#checkout:active:not(:disabled) { background: var(--green-pressed); transform: scale(.99); }
-#checkout:disabled { background: var(--disabled); color: #bac1ca; cursor: not-allowed; opacity: .56; }
+#checkout svg, #email-submit svg { position: absolute; right: 17px; width: 23px; }
+#checkout:hover:not(:disabled), #email-submit:hover:not(:disabled) { background: #46f177; }
+#checkout:active:not(:disabled), #email-submit:active:not(:disabled) { background: var(--green-pressed); transform: scale(.99); }
+#checkout:disabled, #email-submit:disabled { background: var(--disabled); color: #bac1ca; cursor: not-allowed; opacity: .56; }
 .button-loader { display: none; width: 20px; height: 20px; border: 2px solid rgba(5,16,9,.3); border-top-color: #051009; border-radius: 50%; animation: spin .7s linear infinite; }
-#checkout.loading .button-label, #checkout.loading svg { display: none; }
-#checkout.loading .button-loader { display: block; }
+#checkout.loading .button-label, #checkout.loading svg, #email-submit.loading .button-label, #email-submit.loading svg { display: none; }
+#checkout.loading .button-loader, #email-submit.loading .button-loader { display: block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .secure-note { display: flex; align-items: center; justify-content: center; gap: 7px; margin: 13px 0 0; color: #84909f; font-size: 11px; }
 .secure-note svg { width: 14px; }
@@ -151,6 +151,11 @@ h1 span { color: var(--green); }
 .payment-heading { text-align: center; }
 .payment-heading h1 { font-size: 34px; }
 .payment-heading > p:last-child { margin: 10px auto 0; }
+.identity-heading { margin-bottom: 24px; }
+.identity-card { padding: 20px; border: 1px solid var(--border); border-radius: 20px; background: var(--surface); box-shadow: var(--shadow); }
+.identity-card #email-submit { margin-top: 18px; }
+.privacy-note { margin: 4px 2px 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.form-error { margin: 8px 2px 0; color: var(--error); font-size: 12px; line-height: 1.45; }
 .qr-card { width: min(76vw, 290px); aspect-ratio: 1; margin: 25px auto 17px; padding: 13px; border-radius: 22px; background: #fff; box-shadow: 0 16px 45px rgba(0,0,0,.35); }
 .qr-card img { display: block; width: 100%; height: 100%; border-radius: 13px; }
 .payment-summary { display: flex; align-items: center; justify-content: space-between; margin: 0 4px 14px; color: var(--muted); font-size: 13px; }

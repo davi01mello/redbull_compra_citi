@@ -45,6 +45,7 @@ async def reset_database() -> None:
 def order_payload() -> OrderCreate:
     return OrderCreate(
         buyer_name="Teste orquestração",
+        payer_email="comprador@example.com",
         pricing_audience=PricingAudience.MEMBER,
         items=[OrderItemInput(product_id="original", quantity=2)],
     )
@@ -63,12 +64,14 @@ class RecordingProvider:
         external_reference: str,
         amount: Decimal,
         idempotency_key: str,
+        payer_email: str,
     ) -> ChargeResult:
         self.calls.append(
             {
                 "external_reference": external_reference,
                 "amount": amount,
                 "idempotency_key": idempotency_key,
+                "payer_email": payer_email,
                 "transaction_open": self.db.in_transaction() if self.db else None,
             }
         )
@@ -210,7 +213,9 @@ class CrashOnceIdempotentProvider(RecordingProvider):
         external_reference: str,
         amount: Decimal,
         idempotency_key: str,
+        payer_email: str,
     ) -> ChargeResult:
+        assert payer_email == "comprador@example.com"
         charge = self.unique_charges.setdefault(
             idempotency_key,
             ChargeResult(

@@ -15,7 +15,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import settings
 from .db.base import AsyncSessionLocal, get_db
 from .models import (
-    ManualReview,
     Order,
     OrderCreate,
     PriceTier,
@@ -33,7 +32,6 @@ from .payment_service import (
     cancel_order_payment,
     create_order_with_payment,
     expire_due_payments,
-    list_manual_reviews,
     process_mercadopago_payment,
 )
 from .store import store
@@ -178,14 +176,6 @@ async def order_pix_qr(
     )
 
 
-@app.get("/api/manual-reviews", response_model=list[ManualReview])
-async def manual_reviews(
-    unresolved_only: bool = True,
-    db: AsyncSession = Depends(get_db),
-) -> list[ManualReview]:
-    return await list_manual_reviews(db, unresolved_only)
-
-
 @app.post("/api/webhooks/mercadopago")
 async def mercadopago_webhook(
     request: Request,
@@ -205,16 +195,6 @@ async def mercadopago_webhook(
 
     webhook_secret = (
         request.app.state.payment_settings.mercadopago_webhook_secret
-    )
-
-    logger.warning(
-        "Diagnóstico webhook: "
-        "signature_present=%s request_id_present=%s "
-        "data_id_present=%s secret_present=%s",
-        bool(x_signature),
-        bool(x_request_id),
-        bool(provider_order_id),
-        bool(webhook_secret),
     )
 
     # A assinatura deve ser validada usando o data.id da URL.

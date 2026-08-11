@@ -215,6 +215,27 @@ function validName(showError = false) {
   return valid;
 }
 
+function normalizedEmail() {
+  return el('payer-email').value.trim().toLowerCase();
+}
+
+function validEmail(showError = false) {
+  const input = el('payer-email');
+  const value = normalizedEmail();
+  const valid = value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+  const shouldShow = showError && !valid;
+  input.closest('.email-field').classList.toggle('invalid', shouldShow);
+  input.setAttribute('aria-invalid', String(shouldShow));
+  el('email-error').textContent = shouldShow
+    ? 'Informe um e-mail válido com no máximo 254 caracteres.'
+    : '';
+  return valid;
+}
+
+function validateEmailForm(showError = false) {
+  el('email-submit').disabled = state.submitting || !validEmail(showError);
+}
+
 function validateForm(showNameError = false) {
   const cart = cartDetails();
   const hasPricedItems = cart.count > 0 && Boolean(cart.tier);
@@ -223,9 +244,10 @@ function validateForm(showNameError = false) {
 
 function setSubmitting(value) {
   state.submitting = value;
-  el('checkout').classList.toggle('loading', value);
-  el('checkout').setAttribute('aria-busy', String(value));
+  el('email-submit').classList.toggle('loading', value);
+  el('email-submit').setAttribute('aria-busy', String(value));
   validateForm();
+  validateEmailForm();
 }
 
 function show(view) {
@@ -407,17 +429,34 @@ function startPaymentPolling() {
 
 el('buyer-name').addEventListener('input', () => validateForm(false));
 el('buyer-name').addEventListener('blur', () => validName(true));
+el('payer-email').addEventListener('input', () => {
+  el('email-network-error').classList.add('hidden');
+  validateEmailForm(false);
+});
+el('payer-email').addEventListener('blur', () => validEmail(true));
 
 el('order-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (!validName(true) || !cartDetails().count || state.submitting) return;
+  show('email');
+  validateEmailForm(false);
+  el('payer-email').focus();
+});
+
+el('back-email').addEventListener('click', () => show('shop'));
+
+el('email-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!validEmail(true) || !validName(true) || !cartDetails().count || state.submitting) return;
   setSubmitting(true);
+  el('email-network-error').classList.add('hidden');
   try {
     const items = cartDetails().entries.map(([product_id, quantity]) => ({ product_id, quantity }));
     state.order = await api('/api/orders', {
       method: 'POST',
       body: JSON.stringify({
         buyer_name: el('buyer-name').value.trim(),
+        payer_email: normalizedEmail(),
         pricing_audience: state.pricingAudience,
         items
       })
@@ -429,8 +468,8 @@ el('order-form').addEventListener('submit', async event => {
     show('payment');
     startPaymentPolling();
   } catch (error) {
-    toast(error.message);
-    await loadProducts().catch(() => {});
+    el('email-network-error').textContent = error.message;
+    el('email-network-error').classList.remove('hidden');
   } finally {
     setSubmitting(false);
   }
@@ -501,6 +540,7 @@ el('new-order').addEventListener('click', async () => {
   state.cart = {};
   state.order = null;
   el('order-form').reset();
+  el('email-form').reset();
   el('simulate-payment').disabled = false;
   el('simulate-payment').textContent = 'Simular confirmação';
   await loadProducts().catch(error => toast(error.message));
@@ -509,7 +549,7 @@ el('new-order').addEventListener('click', async () => {
 });
 
 function route() {
-  const activeProtectedView = ['payment', 'success'].some(view => !el(`${view}-view`).classList.contains('hidden'));
+  const activeProtectedView = ['email', 'payment', 'success'].some(view => !el(`${view}-view`).classList.contains('hidden'));
   if (!activeProtectedView) show('shop');
 }
 

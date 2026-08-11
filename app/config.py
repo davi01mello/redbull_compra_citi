@@ -17,9 +17,6 @@ class Settings:
     charge_expires_in: int
     payment_checkout_expires_in: int = 600
     payment_expiration_check_interval: int = 5
-    mercadopago_test_payer_first_name: str | None = None
-    mercadopago_test_payer_email: str | None = None
-    mercadopago_payer_email: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -55,15 +52,6 @@ class Settings:
             charge_expires_in=charge_expires_in,
             payment_checkout_expires_in=payment_checkout_expires_in,
             payment_expiration_check_interval=payment_expiration_check_interval,
-            mercadopago_test_payer_first_name=(
-                os.getenv("MERCADOPAGO_TEST_PAYER_FIRST_NAME", "").strip() or None
-            ),
-            mercadopago_test_payer_email=(
-                os.getenv("MERCADOPAGO_TEST_PAYER_EMAIL", "").strip() or None
-            ),
-            mercadopago_payer_email=(
-                os.getenv("MERCADOPAGO_PAYER_EMAIL", "").strip() or None
-            ),
         )
 
     def validate(self) -> None:

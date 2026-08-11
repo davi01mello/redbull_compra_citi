@@ -53,7 +53,9 @@ class ExpirationTestProvider:
         external_reference: str,
         amount: Decimal,
         idempotency_key: str,
+        payer_email: str,
     ) -> ChargeResult:
+        assert payer_email == "comprador@example.com"
         order_id = f"expiration-order-{external_reference}"
         payment_id = f"expiration-payment-{external_reference}"
         self.orders[order_id] = PaymentResult(
@@ -132,6 +134,7 @@ async def reset_database(stock_overrides: dict[str, int] | None = None) -> None:
 def payload(name: str = "Expiração", quantity: int = 1) -> OrderCreate:
     return OrderCreate(
         buyer_name=name,
+        payer_email="comprador@example.com",
         pricing_audience=PricingAudience.MEMBER,
         items=[OrderItemInput(product_id="original", quantity=quantity)],
     )
@@ -483,15 +486,4 @@ def test_webhook_anomalies_are_listed_for_manual_review(
     asyncio.run(engine.dispose())
 
     assert result.outcome == expected_outcome
-    assert response.status_code == 200
-    assert response.json() == [
-        {
-            "id": response.json()[0]["id"],
-            "order_id": str(order.id),
-            "buyer_name": "Revisão manual",
-            "reason": expected_reason.value,
-            "details": response.json()[0]["details"],
-            "created_at": response.json()[0]["created_at"],
-            "resolved_at": None,
-        }
-    ]
+    assert response.status_code == 404

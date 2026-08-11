@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#070d16">
   <title>Red Bull no CITi</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260806-2">
+  <link rel="stylesheet" href="/static/styles.css?v=20260811-1">
 </head>
 <body>
   <main class="app-shell">
@@ -49,12 +49,56 @@
             <strong id="cart-total">R$ 0,00</strong>
           </div>
           <button type="submit" id="checkout" disabled>
-            <span class="button-label">Pagar com PIX</span>
+            <span class="button-label">Continuar</span>
             <span class="button-loader" aria-hidden="true"></span>
             <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
           </button>
           <p class="secure-note"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro e instantâneo</p>
         </aside>
+      </form>
+    </section>
+
+    <section id="email-view" class="view hidden" aria-labelledby="email-title">
+      <div class="view-topline">
+        <button class="icon-button" id="back-email" type="button" aria-label="Voltar ao carrinho"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
+        <a class="brand brand-small" href="#/comprar" aria-label="CITi — início"><img src="/static/assets/logo-citi-transparent.png?v=20260802-2" alt=""></a>
+        <span class="topline-spacer"></span>
+      </div>
+
+      <div class="payment-heading identity-heading">
+        <p class="eyebrow">Identificação</p>
+        <h1 id="email-title">Informe seu e-mail</h1>
+        <p>Informe seu e-mail para identificarmos o pagador e processarmos corretamente o pagamento.</p>
+      </div>
+
+      <form id="email-form" class="identity-card" novalidate>
+        <div class="email-field">
+          <label for="payer-email">E-mail</label>
+          <div class="input-wrap">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h16v14H4zM4 7l8 6 8-6"/></svg>
+            <input
+              id="payer-email"
+              type="email"
+              name="email"
+              autocomplete="email"
+              inputmode="email"
+              maxlength="254"
+              required
+              placeholder="voce@exemplo.com"
+              aria-describedby="email-error email-network-error email-privacy"
+            >
+          </div>
+          <small id="email-error" class="field-error" aria-live="polite"></small>
+        </div>
+
+        <p id="email-network-error" class="form-error hidden" role="alert"></p>
+        <p id="email-privacy" class="privacy-note">Usaremos este dado somente para identificar e processar o pagamento.</p>
+
+        <button type="submit" id="email-submit" disabled>
+          <span class="button-label">Continuar para o pagamento</span>
+          <span class="button-loader" aria-hidden="true"></span>
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+        </button>
       </form>
     </section>
 
@@ -120,6 +164,6 @@
   </main>
 
   <div id="toast" role="alert" aria-live="assertive"></div>
-  <script src="/static/app.js?v=20260806-2"></script>
+  <script src="/static/app.js?v=20260811-1"></script>
 </body>
 </html>

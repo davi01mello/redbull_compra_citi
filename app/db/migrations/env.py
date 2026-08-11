@@ -15,6 +15,28 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+UNMANAGED_TABLES = {"stock_adjustments", "users"}
+UNMANAGED_COLUMNS = {
+    ("products", "color"),
+    ("products", "description"),
+    ("products", "price"),
+}
+
+
+def include_object(object_, name, type_, reflected, compare_to) -> bool:
+    """Preserva objetos preexistentes que não pertencem a este serviço."""
+    if (
+        type_ == "table"
+        and reflected
+        and compare_to is None
+        and name in UNMANAGED_TABLES
+    ):
+        return False
+    if type_ == "column" and reflected and compare_to is None:
+        table_name = getattr(getattr(object_, "table", None), "name", None)
+        if (table_name, name) in UNMANAGED_COLUMNS:
+            return False
+    return True
 
 
 def run_migrations_offline() -> None:
@@ -24,6 +46,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        include_object=include_object,
     )
 
     with context.begin_transaction():
@@ -35,6 +58,7 @@ def do_run_migrations(connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         compare_type=True,
+        include_object=include_object,
     )
 
     with context.begin_transaction():

@@ -187,7 +187,8 @@ class DatabaseStore:
             total = sum((item.subtotal for item in items), start=Decimal("0.00"))
             order = OrderORM(
                 id=order_id,
-                buyer_name=payload.buyer_name.strip(),
+                buyer_name=payload.buyer_name,
+                payer_email=payload.payer_email,
                 items=items,
                 total=total,
                 status=OrderStatus.PENDING,

@@ -10,7 +10,6 @@ import pytest
 
 from app.config import Settings
 from app.payments import (
-    MERCADOPAGO_FALLBACK_PAYER_EMAIL,
     MercadoPagoProvider,
     MockPaymentProvider,
     PaymentProviderError,
@@ -23,16 +22,12 @@ def mercadopago_settings(
     *,
     access_token: str = "TEST-ACCESS-TOKEN",
     webhook_secret: str = "test-webhook-secret",
-    test_payer_first_name: str | None = None,
-    test_payer_email: str | None = None,
 ) -> Settings:
     return Settings(
         mercadopago_access_token=access_token,
         mercadopago_webhook_secret=webhook_secret,
         payment_provider="mercadopago",
         charge_expires_in=1800,
-        mercadopago_test_payer_first_name=test_payer_first_name,
-        mercadopago_test_payer_email=test_payer_email,
     )
 
 
@@ -79,6 +74,7 @@ def test_create_charge_sends_correct_payload_auth_and_idempotency_key():
             external_reference="order-local-789",
             amount=Decimal("16.00"),
             idempotency_key="charge-order-local-789",
+            payer_email="comprador@example.com",
         )
 
     result = run_with_provider(handler, create)
@@ -103,7 +99,7 @@ def test_create_charge_sends_correct_payload_auth_and_idempotency_key():
                 }
             ]
         },
-        "payer": {"email": MERCADOPAGO_FALLBACK_PAYER_EMAIL},
+        "payer": {"email": "comprador@example.com"},
     }
     assert result.provider_order_id == "order-123"
     assert result.provider_payment_id == "payment-456"
@@ -114,58 +110,17 @@ def test_create_charge_sends_correct_payload_auth_and_idempotency_key():
     assert 590 <= remaining <= 600
 
 
-def test_create_charge_includes_test_payer_fields_only_when_configured():
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["payload"] = json.loads(request.content)
-        return httpx.Response(
-            201,
-            json={
-                "id": "order-apro",
-                "transactions": {
-                    "payments": [
-                        {
-                            "id": "payment-apro",
-                            "payment_method": {
-                                "qr_code": "PIX-APRO",
-                                "ticket_url": "https://example.test/pix/apro",
-                            },
-                        }
-                    ]
-                },
-            },
-        )
-
+def test_create_charge_requires_order_payer_email():
     async def create(provider):
         return await provider.create_charge(
-            external_reference="order-test-apro",
+            external_reference="order-without-email",
             amount=Decimal("8.50"),
-            idempotency_key="charge-test-apro",
+            idempotency_key="charge-without-email",
+            payer_email="",
         )
 
-    async def scenario():
-        client = httpx.AsyncClient(
-            transport=httpx.MockTransport(handler),
-            base_url="https://api.mercadopago.com",
-        )
-        provider = MercadoPagoProvider(
-            mercadopago_settings(
-                test_payer_first_name="APRO",
-                test_payer_email="test_user_br@testuser.com",
-            ),
-            client=client,
-        )
-        try:
-            await create(provider)
-        finally:
-            await provider.aclose()
-
-    asyncio.run(scenario())
-    assert captured["payload"]["payer"] == {
-        "email": "test_user_br@testuser.com",
-        "first_name": "APRO",
-    }
+    with pytest.raises(PaymentProviderError, match="não possui e-mail"):
+        run_with_provider(lambda _request: httpx.Response(500), create)
 
 
 def test_create_charge_rejects_invalid_provider_response():
@@ -173,7 +128,9 @@ def test_create_charge_rejects_invalid_provider_response():
         return httpx.Response(201, content=b"not-json")
 
     async def create(provider):
-        return await provider.create_charge("order-1", Decimal("8.50"), "key-1")
+        return await provider.create_charge(
+            "order-1", Decimal("8.50"), "key-1", "comprador@example.com"
+        )
 
     with pytest.raises(PaymentProviderError, match="Resposta inválida"):
         run_with_provider(handler, create)
@@ -184,7 +141,9 @@ def test_create_charge_reports_timeout():
         raise httpx.ReadTimeout("simulated timeout", request=request)
 
     async def create(provider):
-        return await provider.create_charge("order-1", Decimal("8.50"), "key-1")
+        return await provider.create_charge(
+            "order-1", Decimal("8.50"), "key-1", "comprador@example.com"
+        )
 
     with pytest.raises(PaymentProviderError, match="Tempo esgotado"):
         run_with_provider(handler, create)
@@ -195,7 +154,9 @@ def test_create_charge_reports_provider_http_error():
         return httpx.Response(400, json={"message": "invalid payer data"})
 
     async def create(provider):
-        return await provider.create_charge("order-1", Decimal("8.50"), "key-1")
+        return await provider.create_charge(
+            "order-1", Decimal("8.50"), "key-1", "comprador@example.com"
+        )
 
     with pytest.raises(PaymentProviderError, match="invalid payer data"):
         run_with_provider(handler, create)
@@ -237,6 +198,18 @@ def test_cancel_order_accepts_already_cancelled_response_as_idempotent():
     run_with_provider(handler, cancel)
 
 
+def test_error_code_finds_nested_mercadopago_shapes():
+    for payload in (
+        {"code": "top"},
+        {"error": "error-field"},
+        {"errors": [{"code": "errors-field"}]},
+        {"details": [{"error": "details-field"}]},
+        {"cause": [{"code": "cause-field"}]},
+    ):
+        response = httpx.Response(409, json=payload)
+        assert MercadoPagoProvider._error_code(response)
+
+
 def test_cancel_order_reports_provider_error():
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -249,6 +222,33 @@ def test_cancel_order_reports_provider_error():
 
     with pytest.raises(PaymentProviderError, match="already paid"):
         run_with_provider(handler, cancel)
+
+
+def test_cancel_order_reports_timeout_without_leaking_sensitive_data():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timeout with comprador@example.com", request=request)
+
+    async def cancel(provider):
+        await provider.cancel_order("ORD123", "cancel-key")
+
+    with pytest.raises(PaymentProviderError, match="Tempo esgotado"):
+        run_with_provider(handler, cancel)
+
+
+def test_provider_error_detail_redacts_email_and_bearer_token():
+    response = httpx.Response(
+        400,
+        json={
+            "code": "invalid_payer",
+            "message": (
+                "payer comprador@example.com Authorization Bearer secret-token"
+            ),
+        },
+    )
+    detail = MercadoPagoProvider._error_detail(response)
+    assert "comprador@example.com" not in detail
+    assert "secret-token" not in detail
+    assert "<redacted-email>" in detail
 
 
 def test_create_charge_rejects_response_without_pix_code():
@@ -269,7 +269,9 @@ def test_create_charge_rejects_response_without_pix_code():
         )
 
     async def create(provider):
-        return await provider.create_charge("order-1", Decimal("8.50"), "key-1")
+        return await provider.create_charge(
+            "order-1", Decimal("8.50"), "key-1", "comprador@example.com"
+        )
 
     with pytest.raises(PaymentProviderError, match="não retornou a URL do QR Code"):
         run_with_provider(handler, create)
