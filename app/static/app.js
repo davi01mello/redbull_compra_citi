@@ -248,6 +248,8 @@ function setSubmitting(value) {
 function show(view) {
   document.querySelectorAll('.view').forEach(item => item.classList.add('hidden'));
   el(`${view}-view`).classList.remove('hidden');
+  const checkoutVisible = view === 'shop';
+  el('checkout-fixed').classList.toggle('hidden', !checkoutVisible);
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 

@@ -53,19 +53,21 @@ def test_frontend_validates_normalizes_and_prevents_duplicate_submission():
 def test_shop_has_fixed_checkout_bar_and_no_hidden_demo_texts():
     css = (STATIC_DIR / "styles.css").read_text()
     html = (STATIC_DIR / "index.html").read_text()
+    javascript = (STATIC_DIR / "app.js").read_text()
+    assert '.checkout-fixed' in css
     assert 'position: fixed' in css
-    assert 'padding-bottom: max(12px, env(safe-area-inset-bottom))' in css
-    assert '#checkout' in css
+    assert 'padding: 12px 16px max(12px, env(safe-area-inset-bottom))' in css
+    assert 'checkout-fixed__content' in css
     assert 'cart-total' in html
-    assert 'checkout' in html
-    assert 'section id="shop-view"' in html
-    assert 'position: fixed' in css
-    assert 'min-width: 320px' in css
-    assert 'padding-bottom' in css
+    assert 'id="checkout-fixed"' in html
+    assert 'id="checkout"' in html
+    assert 'form="order-form"' in html
     assert 'simulate-payment' not in html
     assert 'simulate-payment' not in css
     assert 'demo-box' not in css
     assert 'pricing-summary' not in html
+    assert "el('checkout-fixed').classList.toggle('hidden', !checkoutVisible)" in javascript
+    assert "const checkoutVisible = view === 'shop';" in javascript
 
 
 def test_repository_has_no_local_or_fixed_payer_fallback():

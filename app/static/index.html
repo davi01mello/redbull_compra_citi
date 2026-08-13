@@ -30,20 +30,24 @@
           <div class="product-skeleton"></div>
           <div class="product-skeleton"></div>
         </div>
-
-        <aside class="checkout-panel" aria-label="Resumo do pedido">
-          <div class="total-row">
-            <span><b id="cart-count">0 itens</b><small>Total do pedido</small></span>
-            <strong id="cart-total">R$ 0,00</strong>
-          </div>
-          <button type="submit" id="checkout" disabled>
-            <span class="button-label">Continuar</span>
-            <span class="button-loader" aria-hidden="true"></span>
-            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
-          </button>
-          <p class="secure-note"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro e instantâneo</p>
-        </aside>
       </form>
+
+      <div id="checkout-fixed" class="checkout-fixed" aria-live="polite">
+        <div class="checkout-fixed__content">
+          <aside class="checkout-panel" aria-label="Resumo do pedido">
+            <div class="total-row">
+              <span><b id="cart-count">0 itens</b><small>Total do pedido</small></span>
+              <strong id="cart-total">R$ 0,00</strong>
+            </div>
+            <button type="submit" id="checkout" form="order-form" disabled>
+              <span class="button-label">Continuar</span>
+              <span class="button-loader" aria-hidden="true"></span>
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+            </button>
+            <p class="secure-note"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro e instantâneo</p>
+          </aside>
+        </div>
+      </div>
     </section>
 
     <section id="email-view" class="view hidden" aria-labelledby="email-title">
