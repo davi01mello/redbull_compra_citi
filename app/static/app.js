@@ -108,12 +108,6 @@ function tierQuantityLabel(tier) {
   return `${tier.min_quantity}–${tier.max_quantity} unidades`;
 }
 
-function renderPricingSummary() {
-  const audience = state.pricingAudience === 'MEMBER' ? 'Preço para membros' : 'Preço para não membros';
-  const tiers = state.pricingTiers.map(tier => `${tierQuantityLabel(tier)}: ${money(tier.unit_price)}`).join(' · ');
-  el('pricing-summary').textContent = `${audience} — ${tiers}`;
-}
-
 async function loadProducts() {
   state.loading = true;
   el('products').setAttribute('aria-busy', 'true');
@@ -128,7 +122,6 @@ async function loadProducts() {
     if (!state.pricingTiers.length) {
       throw new Error('Não há uma faixa de preço disponível para este ponto de venda.');
     }
-    renderPricingSummary();
     const order = { tropical: 0, melancia: 1, original: 2 };
     state.products.sort((a, b) => (order[a.id] ?? 99) - (order[b.id] ?? 99));
     const validIds = new Set(state.products.map(product => product.id));
@@ -233,13 +226,15 @@ function validEmail(showError = false) {
 }
 
 function validateEmailForm(showError = false) {
-  el('email-submit').disabled = state.submitting || !validEmail(showError);
+  const hasValidName = validName(false);
+  const hasValidEmail = validEmail(showError);
+  el('email-submit').disabled = state.submitting || !hasValidName || !hasValidEmail;
 }
 
 function validateForm(showNameError = false) {
   const cart = cartDetails();
   const hasPricedItems = cart.count > 0 && Boolean(cart.tier);
-  el('checkout').disabled = state.loading || state.submitting || !hasPricedItems || !validName(showNameError);
+  el('checkout').disabled = state.loading || state.submitting || !hasPricedItems;
 }
 
 function setSubmitting(value) {
@@ -427,7 +422,10 @@ function startPaymentPolling() {
   refreshPaymentStatus(session);
 }
 
-el('buyer-name').addEventListener('input', () => validateForm(false));
+el('buyer-name').addEventListener('input', () => {
+  validateForm(false);
+  validateEmailForm(false);
+});
 el('buyer-name').addEventListener('blur', () => validName(true));
 el('payer-email').addEventListener('input', () => {
   el('email-network-error').classList.add('hidden');
@@ -437,9 +435,13 @@ el('payer-email').addEventListener('blur', () => validEmail(true));
 
 el('order-form').addEventListener('submit', async event => {
   event.preventDefault();
-  if (!validName(true) || !cartDetails().count || state.submitting) return;
+  if (!cartDetails().count || state.submitting) return;
   show('email');
   validateEmailForm(false);
+  if (!validName(false)) {
+    el('buyer-name').focus();
+    return;
+  }
   el('payer-email').focus();
 });
 
@@ -464,7 +466,6 @@ el('email-form').addEventListener('submit', async event => {
     el('qr-code').src = state.order.payment.qr_code;
     el('pix-code').textContent = state.order.payment.copy_paste;
     el('payment-total').textContent = money(state.order.total);
-    el('simulate-payment').classList.toggle('hidden', !state.order.payment.simulated);
     show('payment');
     startPaymentPolling();
   } catch (error) {
@@ -482,21 +483,6 @@ el('copy-pix').addEventListener('click', async () => {
     setTimeout(() => { el('copy-pix').querySelector('span').textContent = 'Copiar código PIX'; }, 2000);
   } catch {
     toast('Não foi possível copiar. Selecione o código manualmente.');
-  }
-});
-
-el('simulate-payment').addEventListener('click', async () => {
-  if (!state.order) return;
-  const button = el('simulate-payment');
-  try {
-    button.disabled = true;
-    button.textContent = 'Confirmando...';
-    await api(`/api/mock/pay/${state.order.payment.txid}`, { method: 'POST' });
-    await refreshPaymentStatus();
-  } catch (error) {
-    toast(error.message);
-    button.disabled = false;
-    button.textContent = 'Simular confirmação';
   }
 });
 
@@ -541,8 +527,6 @@ el('new-order').addEventListener('click', async () => {
   state.order = null;
   el('order-form').reset();
   el('email-form').reset();
-  el('simulate-payment').disabled = false;
-  el('simulate-payment').textContent = 'Simular confirmação';
   await loadProducts().catch(error => toast(error.message));
   location.hash = '#/comprar';
   show('shop');
@@ -559,6 +543,5 @@ loadProducts().then(route).catch(error => {
   el('products').setAttribute('aria-busy', 'false');
   el('products').innerHTML = '<div class="product sold-out"><div class="product-copy"><h3>Não foi possível carregar</h3><p>Atualize a página para tentar novamente.</p></div></div>';
   el('stock-note').textContent = 'Erro ao carregar';
-  el('pricing-summary').textContent = 'Preço indisponível para este link.';
   toast(error.message);
 });
