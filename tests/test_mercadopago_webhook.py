@@ -66,7 +66,9 @@ class MercadoPagoWebhookTestProvider:
         external_reference: str,
         amount: Decimal,
         idempotency_key: str,
+        payer_email: str,
     ) -> ChargeResult:
+        assert payer_email == "comprador@example.com"
         order_id = f"mp-order-{external_reference}"
         payment_id = f"mp-payment-{external_reference}"
         self.order_results[order_id] = PaymentResult(
@@ -104,6 +106,7 @@ class MercadoPagoWebhookTestProvider:
 def order_payload() -> OrderCreate:
     return OrderCreate(
         buyer_name="Webhook Mercado Pago",
+        payer_email="comprador@example.com",
         pricing_audience=PricingAudience.MEMBER,
         items=[OrderItemInput(product_id="original", quantity=2)],
     )
@@ -154,6 +157,7 @@ def post_webhook(provider, event_id, order_id, headers=None):
         client.app.state.payment_settings = webhook_settings()
         return client.post(
             "/api/webhooks/mercadopago",
+            params={"data.id": order_id, "type": "order"},
             json=webhook_body(event_id, order_id),
             headers=headers or signature_headers(order_id),
         )
@@ -264,6 +268,39 @@ def test_invalid_signature_is_rejected_without_querying_or_changing_state():
     assert state[1] == ReservationStatus.ACTIVE
     assert state[3] == PaymentStatus.WAITING_PAYMENT
     assert state[5:] == (INITIAL_STOCK["original"], 2, 0)
+
+
+def test_empty_body_is_accepted_when_data_id_is_in_url():
+    provider = MercadoPagoWebhookTestProvider()
+    order = asyncio.run(create_pending_order(provider))
+    order_id = provider.order_id_for_payment(order.payment.txid)
+    with TestClient(app) as client:
+        client.app.state.payment_provider = provider
+        client.app.state.payment_settings = webhook_settings()
+        response = client.post(
+            "/api/webhooks/mercadopago",
+            params={"data.id": order_id, "type": "order"},
+            content=b"",
+            headers=signature_headers(order_id),
+        )
+    asyncio.run(engine.dispose())
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "not_approved"
+    assert provider.queries == [order_id]
+
+
+def test_webhook_without_data_id_is_rejected_before_provider_query():
+    provider = MercadoPagoWebhookTestProvider()
+    with TestClient(app) as client:
+        client.app.state.payment_provider = provider
+        client.app.state.payment_settings = webhook_settings()
+        response = client.post(
+            "/api/webhooks/mercadopago",
+            json={"type": "order"},
+        )
+    asyncio.run(engine.dispose())
+    assert response.status_code == 400
+    assert provider.queries == []
 
 
 def test_duplicate_webhook_does_not_decrement_stock_twice():

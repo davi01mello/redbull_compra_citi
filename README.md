@@ -1,8 +1,36 @@
-# Red Bull PDV — MVP
+# Red Bull PDV
 
-Esqueleto funcional do autoatendimento descrito em `AGENTS.md`. Produtos, pedidos e estoque são persistidos no PostgreSQL. O pagamento PIX ainda é simulado e nenhuma cobrança real é criada.
+Autoatendimento mobile para venda de Red Bull com reserva de estoque e pagamento Pix. O sistema suporta cobranças reais pelo Mercado Pago e mantém o provedor mock somente para desenvolvimento.
 
-## Executar
+## Fluxo de compra
+
+O comprador seleciona os produtos, informa nome e e-mail, confirma a identificação e então recebe o QR Code Pix. O e-mail é validado no navegador e no backend, normalizado e persistido em `orders.payer_email`; registros antigos podem continuar com `NULL`. A criação da Order usa exclusivamente o e-mail persistido no pedido em `payer.email`.
+
+O e-mail do pagador não é uma variável de ambiente. Não configure `MERCADO_PAYER_EMAIL` nem `MERCADOPAGO_PAYER_EMAIL`: cada comprador informa o próprio e-mail no checkout.
+
+Após o pagamento, o webhook assinado consulta `GET /v1/orders/{provider_order_id}`. A confirmação altera pedido, pagamento, reserva e estoque na mesma transação, com locks de linha e verificações de estado para impedir desconto duplicado. Uma reconciliação periódica consulta pagamentos pendentes antes da expiração, cobrindo webhooks perdidos ou consultas precoces.
+
+Nunca corrija somente `orders.status` nem desconte estoque diretamente por SQL. Use o comando de reconciliação, que reutiliza a transação central.
+
+## Configuração
+
+Produção no Render deve usar variáveis de ambiente, sem valores no Git:
+
+```env
+DATABASE_URL=
+PAYMENT_PROVIDER=mercadopago
+MERCADOPAGO_ACCESS_TOKEN=
+MERCADOPAGO_WEBHOOK_SECRET=
+CHARGE_EXPIRES_IN=1800
+PAYMENT_CHECKOUT_EXPIRES_IN=600
+PAYMENT_EXPIRATION_CHECK_INTERVAL=5
+```
+
+O webhook deve ser cadastrado como `POST /api/webhooks/mercadopago`. A aplicação, o segredo do webhook e o Access Token precisam pertencer à mesma integração/conta do Mercado Pago. Não registre tokens, assinaturas, QR Code, código copia e cola ou e-mail completo em logs.
+
+Para desenvolvimento local, use `PAYMENT_PROVIDER=mock`; as rotas `/api/mock/*` respondem 404 quando o Mercado Pago está ativo.
+
+## Execução local
 
 ```bash
 python3 -m venv .venv
@@ -13,23 +41,51 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-Acesse `http://127.0.0.1:8000`. A documentação da API fica em `http://127.0.0.1:8000/docs`.
+A aplicação fica em `http://127.0.0.1:8000` e a documentação em `/docs`.
 
-## Fluxos disponíveis
+## Alembic e banco institucional
 
-- PDV mobile: nome, sabores, quantidades, resumo e criação do pedido.
-- PIX simulado: QR ilustrativo, copia e cola e botão para aprovar localmente.
-- Webhook protegido por token e idempotente (`X-Webhook-Token: mvp-local-token`).
+Na auditoria de 2026-08-11, o banco institucional estava em `e91a7c4d2f30`; o histórico local anterior tinha `a6c42f1d9b73` como head. O banco também contém `users` e `stock_adjustments`, tabelas externas ao ORM/histórico deste serviço, que devem ser preservadas. As colunas históricas `products.description`, `products.color` e `products.price`, presentes em instalações criadas do zero mas ausentes no banco institucional, também são preservadas. Esses objetos estão marcados como não gerenciados no autogenerate para impedir propostas destrutivas.
+
+A revisão `4c7b91e2a6d0` parte do estado remoto `e91a7c4d2f30`, adiciona `orders.payer_email` como anulável e só cria `products.category` quando ausente. A revisão `7e03d1bf5a42` une essa linha à revisão de preço `a6c42f1d9b73`. Nenhuma migration foi aplicada em produção durante esta implementação.
+
+Ordem segura de implantação:
+
+1. confirmar `alembic current`, `alembic heads` e o schema real;
+2. confirmar backup/ponto de restauração;
+3. testar upgrade e downgrade em cópia ou banco de teste;
+4. revisar que `users` e `stock_adjustments` não serão alteradas;
+5. aplicar a migration aprovada;
+6. implantar backend e frontend;
+7. executar uma compra controlada e validar pagamento/reserva/estoque.
+
+Não use `alembic stamp head` e não aplique a migration no banco institucional sem autorização explícita.
+
+## Reparo controlado
+
+Simulação por ID interno:
+
+```bash
+python -m scripts.reconcile_payment --order-id UUID_DO_PEDIDO --dry-run
+```
+
+Simulação por ID do Mercado Pago:
+
+```bash
+python -m scripts.reconcile_payment --provider-order-id ID_DA_ORDER --dry-run
+```
+
+Depois de revisar o status e a compatibilidade do valor, remova `--dry-run` para executar. O evento usa uma chave idempotente derivada de `manual-reconciliation:{provider_order_id}` e a mesma função transacional do webhook.
+
+As consultas de leitura para pagamentos pendentes e consistência das reservas estão em [`docs/payment_diagnostics.sql`](docs/payment_diagnostics.sql).
+
+O inventário dos arquivos adicionados, as decisões de implementação e os procedimentos operacionais estão em [`docs/alteracoes-recentes.md`](docs/alteracoes-recentes.md).
 
 ## Testes
 
-Os testes usam exclusivamente `TEST_DATABASE_URL`. Essa URL deve apontar para um PostgreSQL cujo nome comece com `test` ou termine com `_test`, e não pode ser a mesma de `DATABASE_URL`.
+Os testes usam exclusivamente `TEST_DATABASE_URL`. O nome do banco precisa começar com `test` ou terminar com `_test`, e a URL não pode ser igual a `DATABASE_URL`.
 
 ```bash
 docker compose up -d postgres_test
 pytest
 ```
-
-## Próximas integrações
-
-As rotas `/api/mock/*` são exclusivas do MVP e deverão ser removidas quando um gateway PIX implementar a criação da cobrança e o webhook assinado.

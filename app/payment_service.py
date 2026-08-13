@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+import hashlib
 import logging
 from uuid import UUID, uuid4
 
@@ -61,6 +62,23 @@ class WebhookProcessingResult:
         }
 
 
+@dataclass(frozen=True)
+class ReconciliationSummary:
+    considered: int
+    approved: int
+    pending: int
+    terminal: int
+    failed: int
+
+
+def reconciliation_event_id(prefix: str, provider_order_id: str) -> str:
+    candidate = f"{prefix}:{provider_order_id}"
+    if len(candidate) <= 120:
+        return candidate
+    digest = hashlib.sha256(provider_order_id.encode()).hexdigest()
+    return f"{prefix[:50]}:{digest}"
+
+
 def payment_idempotency_key(order_id: UUID) -> str:
     return f"redbull-order-{order_id}"
 
@@ -88,7 +106,7 @@ async def _prepare_payment(
     db: AsyncSession,
     order_id: UUID,
     provider: PaymentProvider,
-) -> tuple[Decimal, bool]:
+) -> tuple[Decimal, str, bool]:
     provider_name = _provider_name(provider)
     now = datetime.now(UTC)
 
@@ -115,7 +133,9 @@ async def _prepare_payment(
                 PaymentStatus.WAITING_PAYMENT,
                 PaymentStatus.APPROVED,
             } and payment.copy_paste:
-                return Decimal(payment.amount), True
+                if not order.payer_email:
+                    raise PaymentServiceError("O pedido não possui e-mail do pagador")
+                return Decimal(payment.amount), order.payer_email, True
             if payment.status in {
                 PaymentStatus.FAILED,
                 PaymentStatus.EXPIRED,
@@ -139,9 +159,11 @@ async def _prepare_payment(
 
         if order.reservation_status != ReservationStatus.ACTIVE:
             raise PaymentServiceError("O pedido não possui uma reserva ativa")
+        if not order.payer_email:
+            raise PaymentServiceError("O pedido não possui e-mail do pagador")
 
         await db.flush()
-        return Decimal(order.total), False
+        return Decimal(order.total), order.payer_email, False
 
 
 async def _save_charge(
@@ -189,7 +211,9 @@ async def ensure_order_payment(
     order_id: UUID,
     provider: PaymentProvider,
 ) -> Order:
-    amount, already_created = await _prepare_payment(db, order_id, provider)
+    amount, payer_email, already_created = await _prepare_payment(
+        db, order_id, provider
+    )
     if already_created:
         return await _load_order(db, order_id)
 
@@ -198,12 +222,14 @@ async def ensure_order_payment(
             external_reference=str(order_id),
             amount=amount,
             idempotency_key=payment_idempotency_key(order_id),
+            payer_email=payer_email,
         )
-        logger.warning(
-        "Cobrança criada: order_id=%s provider_order_id=%s provider_payment_id=%s",
-        order_id,
-        charge.provider_order_id,
-        charge.provider_payment_id,
+        logger.info(
+            "Cobrança criada: order_id=%s provider_order_id=%s "
+            "provider_payment_id=%s",
+            order_id,
+            charge.provider_order_id,
+            charge.provider_payment_id,
         )
         if charge.amount != amount:
             raise PaymentProviderError(
@@ -300,22 +326,31 @@ async def cancel_order_payment(
             cancellation_idempotency_key(order_id),
         )
     except PaymentProviderError as exc:
-        try:
-            provider_payment = await provider.get_order(provider_order_id)
-        except PaymentProviderError:
-            provider_payment = None
-        if provider_payment is not None and provider_payment.status.upper() == "APPROVED":
-            reconciliation = await process_mercadopago_payment(
-                db,
-                event_id=f"cancel-reconciliation-{provider_order_id}",
-                event_type="cancel.reconciliation",
-                webhook_order_id=provider_order_id,
-                provider_payment=provider_payment,
-            )
-            if reconciliation.processed or reconciliation.outcome == "already_paid":
-                raise PaymentCancellationConflict(
-                    "O pagamento foi aprovado antes do cancelamento e já foi confirmado."
-                ) from exc
+        if provider_name == PaymentProviderName.MERCADOPAGO:
+            try:
+                provider_payment = await provider.get_order(provider_order_id)
+            except PaymentProviderError:
+                provider_payment = None
+            if provider_payment is not None:
+                reconciliation = await process_mercadopago_payment(
+                    db,
+                    event_id=reconciliation_event_id(
+                        "cancel-reconciliation", provider_order_id
+                    ),
+                    event_type="cancel.reconciliation",
+                    webhook_order_id=provider_order_id,
+                    provider_payment=provider_payment,
+                )
+                if reconciliation.processed or reconciliation.outcome == "already_paid":
+                    raise PaymentCancellationConflict(
+                        "O pagamento foi aprovado antes do cancelamento e já foi confirmado."
+                    ) from exc
+                if reconciliation.outcome in {
+                    "remote_cancelled",
+                    "remote_expired",
+                    "already_terminal",
+                }:
+                    return await _load_order(db, order_id)
         raise PaymentServiceError(
             "Não foi possível interromper a cobrança. Tente novamente."
         ) from exc
@@ -353,20 +388,7 @@ async def cancel_order_payment(
                 "A cobrança mudou de estado enquanto era cancelada"
             )
         else:
-            if order.reservation_status == ReservationStatus.ACTIVE:
-                quantities = await _load_quantities(db, order_id)
-                product_ids = sorted(quantities)
-                products = await _lock_products(db, product_ids)
-                for product_id in product_ids:
-                    product = products.get(product_id)
-                    quantity = quantities[product_id]
-                    if product is None or product.reserved_stock < quantity:
-                        raise RuntimeError(
-                            f"Reserva inconsistente para o produto '{product_id}'"
-                        )
-                for product_id in product_ids:
-                    products[product_id].reserved_stock -= quantities[product_id]
-                order.reservation_status = ReservationStatus.RELEASED
+            await _release_locked_reservation(db, order)
 
             order.status = OrderStatus.CANCELLED
             payment.status = PaymentStatus.CANCELLED
@@ -383,12 +405,17 @@ async def _record_webhook_event(
     provider_order_id: str,
     provider_payment_id: str | None,
 ) -> None:
+    safe_event_id = (
+        event_id
+        if len(event_id) <= 120
+        else reconciliation_event_id("webhook-event", event_id)
+    )
     statement = (
         insert(WebhookEventORM)
         .values(
             provider=PaymentProviderName.MERCADOPAGO,
-            event_id=event_id,
-            event_type=event_type,
+            event_id=safe_event_id,
+            event_type=event_type[:120],
             provider_order_id=provider_order_id,
             provider_payment_id=provider_payment_id,
             processed_at=datetime.now(UTC),
@@ -480,12 +507,133 @@ async def _lock_products(
     }
 
 
+async def _release_locked_reservation(
+    db: AsyncSession,
+    order: OrderORM,
+) -> None:
+    if order.reservation_status != ReservationStatus.ACTIVE:
+        return
+    quantities = await _load_quantities(db, order.id)
+    product_ids = sorted(quantities)
+    products = await _lock_products(db, product_ids)
+    for product_id in product_ids:
+        product = products.get(product_id)
+        quantity = quantities[product_id]
+        if product is None or product.reserved_stock < quantity:
+            raise RuntimeError(
+                f"Reserva inconsistente para o produto '{product_id}'"
+            )
+    for product_id in product_ids:
+        products[product_id].reserved_stock -= quantities[product_id]
+    order.reservation_status = ReservationStatus.RELEASED
+
+
+async def reconcile_pending_mercadopago_payments(
+    db: AsyncSession,
+    provider: PaymentProvider,
+    limit: int = 50,
+) -> ReconciliationSummary:
+    if _provider_name(provider) != PaymentProviderName.MERCADOPAGO:
+        return ReconciliationSummary(0, 0, 0, 0, 0)
+
+    safe_limit = max(1, min(limit, 200))
+    async with db.begin():
+        candidates = list(
+            (
+                await db.execute(
+                    select(PaymentORM.provider_order_id)
+                    .where(
+                        PaymentORM.provider == PaymentProviderName.MERCADOPAGO,
+                        PaymentORM.status.in_(
+                            {
+                                PaymentStatus.CREATING,
+                                PaymentStatus.WAITING_PAYMENT,
+                            }
+                        ),
+                        PaymentORM.provider_order_id.is_not(None),
+                    )
+                    .order_by(PaymentORM.updated_at, PaymentORM.order_id)
+                    .limit(safe_limit)
+                )
+            ).scalars()
+        )
+
+    approved = pending = terminal = failed = 0
+    for provider_order_id in candidates:
+        if not provider_order_id:
+            continue
+        try:
+            provider_payment = await provider.get_order(provider_order_id)
+            result = await process_mercadopago_payment(
+                db,
+                event_id=reconciliation_event_id(
+                    f"periodic-reconciliation-{provider_payment.status.lower()}",
+                    provider_order_id,
+                ),
+                event_type="payment.reconciliation",
+                webhook_order_id=provider_order_id,
+                provider_payment=provider_payment,
+            )
+            if result.processed or result.outcome == "already_paid":
+                approved += 1
+            elif result.outcome in {
+                "remote_cancelled",
+                "remote_expired",
+                "already_terminal",
+            }:
+                terminal += 1
+            else:
+                pending += 1
+            logger.info(
+                "Reconciliação Mercado Pago: provider_order_id=%s "
+                "order_id=%s outcome=%s",
+                provider_order_id,
+                result.order_id,
+                result.outcome,
+            )
+        except Exception as exc:
+            failed += 1
+            logger.warning(
+                "Falha na reconciliação Mercado Pago: "
+                "provider_order_id=%s error=%s",
+                provider_order_id,
+                type(exc).__name__,
+            )
+            if db.in_transaction():
+                await db.rollback()
+
+    return ReconciliationSummary(
+        considered=len(candidates),
+        approved=approved,
+        pending=pending,
+        terminal=terminal,
+        failed=failed,
+    )
+
+
 async def expire_due_payments(
     db: AsyncSession,
     as_of: datetime | None = None,
     provider: PaymentProvider | None = None,
 ) -> int:
     cutoff = as_of or datetime.now(UTC)
+    configured_provider = _provider_name(provider) if provider is not None else None
+    if (
+        provider is not None
+        and configured_provider == PaymentProviderName.MERCADOPAGO
+    ):
+        summary = await reconcile_pending_mercadopago_payments(db, provider)
+        if summary.considered:
+            logger.info(
+                "Reconciliação anterior à expiração: considered=%s "
+                "approved=%s pending=%s terminal=%s failed=%s",
+                summary.considered,
+                summary.approved,
+                summary.pending,
+                summary.terminal,
+                summary.failed,
+            )
+
     async with db.begin():
         candidate_payments = list(
             (
@@ -511,12 +659,19 @@ async def expire_due_payments(
         )
 
     candidate_order_ids: list[UUID] = []
-    configured_provider = _provider_name(provider) if provider is not None else None
     for order_id, payment_provider, provider_order_id in candidate_payments:
         if provider is not None:
             if payment_provider != configured_provider:
                 logger.warning(
                     "Cobrança vencida usa provedor diferente do configurado: "
+                    "order_id=%s provider=%s",
+                    order_id,
+                    payment_provider.value,
+                )
+                continue
+            if not provider_order_id:
+                logger.warning(
+                    "Cobrança vencida sem provider_order_id; expiração adiada: "
                     "order_id=%s provider=%s",
                     order_id,
                     payment_provider.value,
@@ -529,12 +684,31 @@ async def expire_due_payments(
                         cancellation_idempotency_key(order_id),
                     )
                 except PaymentProviderError as exc:
+                    remote_result: WebhookProcessingResult | None = None
+                    if configured_provider == PaymentProviderName.MERCADOPAGO:
+                        try:
+                            provider_payment = await provider.get_order(
+                                provider_order_id
+                            )
+                            remote_result = await process_mercadopago_payment(
+                                db,
+                                event_id=reconciliation_event_id(
+                                    "expiration-reconciliation",
+                                    provider_order_id,
+                                ),
+                                event_type="expiration.reconciliation",
+                                webhook_order_id=provider_order_id,
+                                provider_payment=provider_payment,
+                            )
+                        except PaymentProviderError:
+                            remote_result = None
                     logger.warning(
                         "Não foi possível cancelar cobrança vencida no provedor: "
-                        "order_id=%s provider_order_id=%s error=%s",
+                        "order_id=%s provider_order_id=%s outcome=%s error=%s",
                         order_id,
                         provider_order_id,
-                        exc,
+                        remote_result.outcome if remote_result else None,
+                        type(exc).__name__,
                     )
                     continue
         candidate_order_ids.append(order_id)
@@ -568,20 +742,7 @@ async def expire_due_payments(
             ):
                 continue
 
-            if order.reservation_status == ReservationStatus.ACTIVE:
-                quantities = await _load_quantities(db, order_id)
-                product_ids = sorted(quantities)
-                products = await _lock_products(db, product_ids)
-                for product_id in product_ids:
-                    product = products.get(product_id)
-                    quantity = quantities[product_id]
-                    if product is None or product.reserved_stock < quantity:
-                        raise RuntimeError(
-                            f"Reserva inconsistente para o produto '{product_id}'"
-                        )
-                for product_id in product_ids:
-                    products[product_id].reserved_stock -= quantities[product_id]
-                order.reservation_status = ReservationStatus.RELEASED
+            await _release_locked_reservation(db, order)
 
             payment.status = PaymentStatus.EXPIRED
             payment.updated_at = cutoff
@@ -630,7 +791,12 @@ async def process_mercadopago_payment(
             return WebhookProcessingResult("unknown_order")
 
         payment_id, order_id = payment_reference
-        if provider_payment.status.upper() != "APPROVED":
+        remote_status = provider_payment.status.upper()
+        terminal_statuses = {
+            "CANCELLED": PaymentStatus.CANCELLED,
+            "EXPIRED": PaymentStatus.EXPIRED,
+        }
+        if remote_status not in {"APPROVED", *terminal_statuses}:
             await _record_webhook_event(
                 db,
                 event_id,
@@ -639,7 +805,7 @@ async def process_mercadopago_payment(
                 provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("not_approved", order_id)
-        if provider_payment.approved_at is None:
+        if remote_status == "APPROVED" and provider_payment.approved_at is None:
             await _flag_manual_review(
                 db,
                 order_id,
@@ -703,7 +869,50 @@ async def process_mercadopago_payment(
                 provider_payment.provider_payment_id,
             )
             return WebhookProcessingResult("amount_mismatch", order_id)
-
+        if remote_status in terminal_statuses:
+            target_status = terminal_statuses[remote_status]
+            if payment.status == target_status:
+                await _record_webhook_event(
+                    db,
+                    event_id,
+                    event_type,
+                    webhook_order_id,
+                    provider_payment.provider_payment_id,
+                )
+                return WebhookProcessingResult("already_terminal", order_id)
+            if payment.status not in {
+                PaymentStatus.CREATING,
+                PaymentStatus.WAITING_PAYMENT,
+            }:
+                await _record_webhook_event(
+                    db,
+                    event_id,
+                    event_type,
+                    webhook_order_id,
+                    provider_payment.provider_payment_id,
+                )
+                return WebhookProcessingResult(
+                    "inconsistent_payment_state", order_id
+                )
+            await _release_locked_reservation(db, order)
+            payment.status = target_status
+            payment.updated_at = datetime.now(UTC)
+            if remote_status == "CANCELLED":
+                order.status = OrderStatus.CANCELLED
+            await _record_webhook_event(
+                db,
+                event_id,
+                event_type,
+                webhook_order_id,
+                provider_payment.provider_payment_id,
+            )
+            await db.flush()
+            return WebhookProcessingResult(
+                "remote_cancelled"
+                if remote_status == "CANCELLED"
+                else "remote_expired",
+                order_id,
+            )
         late_after_release = (
             order.reservation_status == ReservationStatus.RELEASED
             and payment.status in {
@@ -753,8 +962,6 @@ async def process_mercadopago_payment(
                     or product.stock - product.reserved_stock < quantity
                 ):
                     conflicts.append(product_id)
-                else:
-                    product.stock -= quantity
             if conflicts:
                 await _flag_manual_review(
                     db,
@@ -764,10 +971,14 @@ async def process_mercadopago_payment(
                     + ", ".join(conflicts),
                 )
                 outcome = "approved_late_stock_conflict"
-            elif cancelled_by_buyer:
-                outcome = "approved_after_cancellation"
             else:
-                outcome = "approved_late"
+                for product_id in product_ids:
+                    products[product_id].stock -= quantities[product_id]
+                outcome = (
+                    "approved_after_cancellation"
+                    if cancelled_by_buyer
+                    else "approved_late"
+                )
         else:
             for product_id in product_ids:
                 product = products.get(product_id)
@@ -792,6 +1003,8 @@ async def process_mercadopago_payment(
                 products[product_id].stock -= quantity
 
         payment.status = PaymentStatus.APPROVED
+        if provider_payment.provider_payment_id:
+            payment.provider_payment_id = provider_payment.provider_payment_id
         payment.approved_at = provider_payment.approved_at
         payment.updated_at = provider_payment.approved_at
         order.status = OrderStatus.PAID

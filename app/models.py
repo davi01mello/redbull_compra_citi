@@ -1,8 +1,19 @@
 from datetime import datetime
 from enum import StrEnum
+import re
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def normalize_payer_email(value: str) -> str:
+    normalized = value.strip().lower()
+    if len(normalized) > 254 or not EMAIL_PATTERN.fullmatch(normalized):
+        raise ValueError("Informe um e-mail válido com no máximo 254 caracteres")
+    return normalized
 
 
 class OrderStatus(StrEnum):
@@ -58,8 +69,22 @@ class OrderItemInput(BaseModel):
 
 class OrderCreate(BaseModel):
     buyer_name: str = Field(min_length=2, max_length=80)
+    payer_email: str = Field(min_length=3, max_length=254)
     pricing_audience: PricingAudience
     items: list[OrderItemInput] = Field(min_length=1)
+
+    @field_validator("buyer_name")
+    @classmethod
+    def normalize_buyer_name(cls, value: str) -> str:
+        value = value.strip()
+        if len(value) < 2:
+            raise ValueError("Informe um nome com pelo menos 2 caracteres")
+        return value
+
+    @field_validator("payer_email")
+    @classmethod
+    def validate_payer_email(cls, value: str) -> str:
+        return normalize_payer_email(value)
 
 
 class OrderItem(BaseModel):

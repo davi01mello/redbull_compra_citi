@@ -53,11 +53,83 @@ def test_health_and_products(client):
     assert [tier["unit_price"] for tier in member_tiers] == [8.5, 8.0, 7.5]
 
 
+@pytest.mark.parametrize(
+    "payer_email",
+    [None, "", "sem-arroba", "a@b", f"a@{'b' * 250}.com"],
+)
+def test_new_order_rejects_missing_or_invalid_email(client, payer_email):
+    payload = {
+        "buyer_name": "E-mail inválido",
+        "pricing_audience": "MEMBER",
+        "items": [{"product_id": "original", "quantity": 1}],
+    }
+    if payer_email is not None:
+        payload["payer_email"] = payer_email
+    response = client.post("/api/orders", json=payload)
+    assert response.status_code == 422
+
+
+def test_order_normalizes_and_persists_email_without_exposing_it(client):
+    response = client.post(
+        "/api/orders",
+        json={
+            "buyer_name": "Comprador",
+            "payer_email": "  Comprador@Example.COM  ",
+            "pricing_audience": "MEMBER",
+            "items": [{"product_id": "original", "quantity": 1}],
+        },
+    )
+    assert response.status_code == 201
+    order_id = response.json()["id"]
+    assert "payer_email" not in response.json()
+    asyncio.run(engine.dispose())
+
+    async def persisted_email():
+        async with AsyncSessionLocal() as session:
+            order = (
+                await session.execute(
+                    select(OrderORM).where(OrderORM.id == order_id)
+                )
+            ).scalar_one()
+            return order.payer_email
+
+    assert asyncio.run(persisted_email()) == "comprador@example.com"
+    asyncio.run(engine.dispose())
+
+
+def test_legacy_order_with_null_email_remains_readable(client):
+    created = client.post(
+        "/api/orders",
+        json={
+            "buyer_name": "Pedido antigo",
+            "payer_email": "comprador@example.com",
+            "pricing_audience": "MEMBER",
+            "items": [{"product_id": "original", "quantity": 1}],
+        },
+    ).json()
+    asyncio.run(engine.dispose())
+
+    async def clear_email():
+        async with AsyncSessionLocal() as session, session.begin():
+            await session.execute(
+                update(OrderORM)
+                .where(OrderORM.id == created["id"])
+                .values(payer_email=None)
+            )
+
+    asyncio.run(clear_email())
+    asyncio.run(engine.dispose())
+    response = client.get(f"/api/orders/{created['id']}")
+    assert response.status_code == 200
+    assert response.json()["id"] == created["id"]
+
+
 def test_product_listing_shows_stock_minus_active_reservations(client):
     created = client.post(
         "/api/orders",
         json={
             "buyer_name": "Reserva visível",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "MEMBER",
             "items": [{"product_id": "original", "quantity": 2}],
         },
@@ -74,6 +146,7 @@ def test_order_payment_is_idempotent(client):
         "/api/orders",
         json={
             "buyer_name": "Felipe",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "MEMBER",
             "items": [{"product_id": "original", "quantity": 2}],
         },
@@ -95,6 +168,7 @@ def test_order_cancellation_releases_reservation_and_is_idempotent(client):
         "/api/orders",
         json={
             "buyer_name": "Cancelamento",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "MEMBER",
             "items": [{"product_id": "original", "quantity": 2}],
         },
@@ -133,6 +207,7 @@ def test_paid_order_cannot_be_cancelled(client):
         "/api/orders",
         json={
             "buyer_name": "Já pago",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "MEMBER",
             "items": [{"product_id": "original", "quantity": 1}],
         },
@@ -150,6 +225,7 @@ def test_order_exposes_locally_generated_pix_qr(client):
         "/api/orders",
         json={
             "buyer_name": "QR local",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "MEMBER",
             "items": [{"product_id": "original", "quantity": 1}],
         },
@@ -176,6 +252,7 @@ def test_order_uses_progressive_price(client, quantity, unit_price, total):
         "/api/orders",
         json={
             "buyer_name": "Felipe",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "MEMBER",
             "items": [
                 {
@@ -201,6 +278,7 @@ def test_order_uses_fixed_non_member_price(client, quantity, total):
         "/api/orders",
         json={
             "buyer_name": "Visitante",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "NON_MEMBER",
             "items": [{"product_id": "original", "quantity": quantity}],
         },
@@ -218,6 +296,7 @@ def test_progressive_price_uses_total_quantity_across_flavors(client):
         "/api/orders",
         json={
             "buyer_name": "Felipe",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "MEMBER",
             "items": [
                 {"product_id": "original", "quantity": 2},
@@ -237,6 +316,7 @@ def test_order_rejects_invalid_pricing_audience(client):
         "/api/orders",
         json={
             "buyer_name": "Felipe",
+            "payer_email": "comprador@example.com",
             "pricing_audience": "INVALID",
             "items": [{"product_id": "original", "quantity": 1}],
         },
@@ -263,6 +343,7 @@ def test_order_rejects_quantity_without_active_price_tier():
                 "/api/orders",
                 json={
                     "buyer_name": "Felipe",
+                    "payer_email": "comprador@example.com",
                     "pricing_audience": "MEMBER",
                     "items": [{"product_id": "original", "quantity": 1}],
                 },
@@ -294,6 +375,7 @@ def test_concurrent_orders_compete_for_last_available_unit():
                         session,
                         OrderCreate(
                             buyer_name=buyer_name,
+                            payer_email="comprador@example.com",
                             pricing_audience=PricingAudience.MEMBER,
                             items=[OrderItemInput(product_id="original", quantity=1)],
                         ),
@@ -359,6 +441,7 @@ def test_failure_before_reservation_does_not_create_partial_reservation():
                     session,
                     OrderCreate(
                         buyer_name="Sem estoque",
+                        payer_email="comprador@example.com",
                         pricing_audience=PricingAudience.MEMBER,
                         items=[
                             OrderItemInput(product_id="original", quantity=1),
@@ -405,6 +488,7 @@ def test_release_reservation_is_idempotent_and_keeps_physical_stock():
                 session,
                 OrderCreate(
                     buyer_name="Liberar duas vezes",
+                    payer_email="comprador@example.com",
                     pricing_audience=PricingAudience.MEMBER,
                     items=[OrderItemInput(product_id="original", quantity=2)],
                 ),

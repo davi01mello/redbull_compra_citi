@@ -55,6 +55,7 @@ class OrderORM(Base):
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
     buyer_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    payer_email: Mapped[str | None] = mapped_column(String(254), nullable=True)
     total: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     status: Mapped[OrderStatus] = mapped_column(
         Enum(OrderStatus, name="order_status"),
@@ -214,7 +215,10 @@ class WebhookEventORM(Base):
     )
     event_id: Mapped[str] = mapped_column(String(120), primary_key=True)
     event_type: Mapped[str] = mapped_column(String(120), nullable=False)
-    provider_order_id: Mapped[str | None] = mapped_column(String(120))
+    provider_order_id: Mapped[str | None] = mapped_column(
+        String(120),
+        index=True,
+    )
     provider_payment_id: Mapped[str | None] = mapped_column(String(120))
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
