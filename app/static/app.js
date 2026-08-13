@@ -245,11 +245,22 @@ function setSubmitting(value) {
   validateEmailForm();
 }
 
+function updateCheckoutHeight() {
+  const checkout = el('checkout-fixed');
+  if (!checkout || checkout.classList.contains('hidden')) return;
+
+  const height = Math.ceil(checkout.getBoundingClientRect().height || checkout.offsetHeight);
+  if (height > 0) {
+    document.documentElement.style.setProperty('--checkout-bar-height', `${height}px`);
+  }
+}
+
 function show(view) {
   document.querySelectorAll('.view').forEach(item => item.classList.add('hidden'));
   el(`${view}-view`).classList.remove('hidden');
-  const checkoutVisible = view === 'shop';
-  el('checkout-fixed').classList.toggle('hidden', !checkoutVisible);
+  const checkout = el('checkout-fixed');
+  checkout.classList.toggle('hidden', view !== 'shop');
+  if (view === 'shop') requestAnimationFrame(updateCheckoutHeight);
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -540,6 +551,14 @@ function route() {
 }
 
 window.addEventListener('hashchange', route);
+window.addEventListener('resize', updateCheckoutHeight);
+window.addEventListener('load', updateCheckoutHeight);
+
+if ('ResizeObserver' in window) {
+  const checkoutObserver = new ResizeObserver(() => updateCheckoutHeight());
+  checkoutObserver.observe(el('checkout-fixed'));
+}
+
 loadProducts().then(route).catch(error => {
   state.loading = false;
   el('products').setAttribute('aria-busy', 'false');

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#070d16">
   <title>Red Bull no CITi</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20260811-1">
+  <link rel="stylesheet" href="/static/styles.css?v=20260813-2">
 </head>
 <body>
   <main class="app-shell">
@@ -32,22 +32,6 @@
         </div>
       </form>
 
-      <div id="checkout-fixed" class="checkout-fixed" aria-live="polite">
-        <div class="checkout-fixed__content">
-          <aside class="checkout-panel" aria-label="Resumo do pedido">
-            <div class="total-row">
-              <span><b id="cart-count">0 itens</b><small>Total do pedido</small></span>
-              <strong id="cart-total">R$ 0,00</strong>
-            </div>
-            <button type="submit" id="checkout" form="order-form" disabled>
-              <span class="button-label">Continuar</span>
-              <span class="button-loader" aria-hidden="true"></span>
-              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
-            </button>
-            <p class="secure-note"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro e instantâneo</p>
-          </aside>
-        </div>
-      </div>
     </section>
 
     <section id="email-view" class="view hidden" aria-labelledby="email-title">
@@ -159,7 +143,24 @@
     </section>
   </main>
 
+  <div id="checkout-fixed" class="checkout-fixed" aria-live="polite">
+    <div class="checkout-fixed__content">
+      <aside class="checkout-panel" aria-label="Resumo do pedido">
+        <div class="total-row">
+          <span><b id="cart-count">0 itens</b><small>Total do pedido</small></span>
+          <strong id="cart-total">R$ 0,00</strong>
+        </div>
+        <button type="submit" id="checkout" form="order-form" disabled>
+          <span class="button-label">Continuar</span>
+          <span class="button-loader" aria-hidden="true"></span>
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+        </button>
+        <p class="secure-note"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro e instantâneo</p>
+      </aside>
+    </div>
+  </div>
+
   <div id="toast" role="alert" aria-live="assertive"></div>
-  <script src="/static/app.js?v=20260813-1"></script>
+  <script src="/static/app.js?v=20260813-2"></script>
 </body>
 </html>
