@@ -26,6 +26,8 @@ from .models import (
     PaymentProvider as PaymentProviderName,
     PaymentStatus,
     ReservationStatus,
+    StockMovementSource,
+    StockMovementType,
 )
 from .payments import (
     ChargeResult,
@@ -33,6 +35,7 @@ from .payments import (
     PaymentProviderError,
     PaymentResult,
 )
+from .stock_service import set_stock_context
 from .store import store
 
 
@@ -943,6 +946,13 @@ async def process_mercadopago_payment(
         quantities = await _load_quantities(db, order_id)
         product_ids = sorted(quantities)
         products = await _lock_products(db, product_ids)
+        # Identifica a venda para o livro-razão de estoque (trigger no banco).
+        await set_stock_context(
+            db,
+            movement_type=StockMovementType.MARKETPLACE_SALE,
+            source=StockMovementSource.MARKETPLACE,
+            order_id=order_id,
+        )
         outcome = "approved"
         if late_after_release:
             cancelled_by_buyer = payment.status == PaymentStatus.CANCELLED

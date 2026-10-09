@@ -9,7 +9,8 @@ from app.db.base import engine
 
 def test_alembic_has_one_explicit_merge_head():
     scripts = ScriptDirectory.from_config(Config("alembic.ini"))
-    assert scripts.get_heads() == ["7e03d1bf5a42"]
+    assert scripts.get_heads() == ["c3f8a1d27b54"]
+    assert scripts.get_revision("c3f8a1d27b54").down_revision == "7e03d1bf5a42"
     revision = scripts.get_revision("4c7b91e2a6d0")
     assert revision.down_revision == "e91a7c4d2f30"
 

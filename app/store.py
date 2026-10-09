@@ -27,7 +27,10 @@ from .models import (
     PricingAudience,
     Product,
     ReservationStatus,
+    StockMovementSource,
+    StockMovementType,
 )
+from .stock_service import set_stock_context
 
 
 @dataclass(frozen=True)
@@ -362,6 +365,12 @@ class DatabaseStore:
                     raise HTTPException(
                         409, "Estoque insuficiente para concluir o pagamento"
                     )
+            await set_stock_context(
+                db,
+                movement_type=StockMovementType.MARKETPLACE_SALE,
+                source=StockMovementSource.MARKETPLACE,
+                order_id=order.id,
+            )
             for product_id in product_ids:
                 quantity = quantities[product_id]
                 products[product_id].stock -= quantity
