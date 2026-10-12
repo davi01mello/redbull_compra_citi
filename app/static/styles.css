@@ -204,6 +204,8 @@ h1 span { color: var(--green); }
 .outline-button svg { width: 21px; }
 .cancel-payment-button { min-height: 46px; border-color: rgba(255, 92, 92, .55); background: transparent; color: #ff8585; }
 .cancel-payment-button:hover { border-color: var(--error); }
+/* TEMPORÁRIO: botão de confirmação manual do pedido (modo mock). */
+.temp-confirm-button { min-height: 46px; border-style: dashed; border-color: var(--green); background: transparent; color: var(--green); }
 .payment-secure { margin-top: 20px; }
 
 .success { text-align: center; }

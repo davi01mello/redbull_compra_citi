@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from enum import StrEnum
 import re
 from uuid import UUID
@@ -299,3 +300,18 @@ class StockSummary(BaseModel):
     total_stock: int
     total_reserved: int
     total_available: int
+
+
+class PriceTable(BaseModel):
+    """Faixas de preço ativas de um público, como exibidas no painel."""
+
+    pricing_audience: PricingAudience
+    base_price: float | None = None
+    tiers: list[PriceTier]
+
+
+class PriceTableUpdate(BaseModel):
+    """Novo preço base (1 lata); para membros, as demais faixas são derivadas dele."""
+
+    pricing_audience: PricingAudience
+    base_price: Decimal = Field(gt=Decimal("0"), le=Decimal("1000.00"), decimal_places=2)

@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .db.base import get_db
 from .models import (
+    PriceTable,
+    PriceTableUpdate,
     StaffLogin,
     StaffUser,
     StockMovement,
@@ -21,6 +23,7 @@ from .models import (
     StockProduct,
     StockSummary,
 )
+from .price_service import list_price_tables, update_price_table
 from .staff_auth import (
     SESSION_COOKIE_NAME,
     StaffPrincipal,
@@ -154,6 +157,29 @@ async def summary(
 ) -> StockSummary:
     response.headers.update(NO_STORE)
     return await stock_summary(db)
+
+
+@api.get("/precos", response_model=list[PriceTable])
+async def price_tables(
+    response: Response,
+    _: StaffPrincipal = Depends(require_staff),
+    db: AsyncSession = Depends(get_db),
+) -> list[PriceTable]:
+    response.headers.update(NO_STORE)
+    return await list_price_tables(db)
+
+
+@api.put(
+    "/precos",
+    response_model=PriceTable,
+    dependencies=[Depends(require_panel_header)],
+)
+async def set_price_table(
+    payload: PriceTableUpdate,
+    staff: StaffPrincipal = Depends(require_staff),
+    db: AsyncSession = Depends(get_db),
+) -> PriceTable:
+    return await update_price_table(db, payload, staff.to_model())
 
 
 router.include_router(api)

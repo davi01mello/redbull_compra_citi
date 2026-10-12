@@ -15,7 +15,14 @@ from app.db.models import (
     StockMovementORM,
 )
 from app.main import app
-from app.models import StaffRole, StaffUser, StockMovementCreate, StockMovementType
+from app.models import (
+    PriceTableUpdate,
+    StaffRole,
+    StaffUser,
+    StockMovementCreate,
+    StockMovementType,
+)
+from app.price_service import update_price_table
 from app.staff_auth import (
     CSRF_HEADER_VALUE,
     SESSION_COOKIE_NAME,
@@ -580,3 +587,150 @@ def test_panel_rolls_back_when_the_ledger_trigger_is_missing(client):
     assert response.status_code == 500
     assert run(product_stock("original")) == (24, 0)
     assert run(fetch_movements()) == []
+
+
+# --- Preços ------------------------------------------------------------------
+
+
+async def snapshot_price_tiers() -> dict[int, bool]:
+    async with AsyncSessionLocal() as session:
+        rows = await session.execute(select(PriceTierORM.id, PriceTierORM.active))
+        return dict(rows.all())
+
+
+async def restore_price_tiers(original: dict[int, bool]) -> None:
+    async with AsyncSessionLocal() as session, session.begin():
+        await session.execute(delete(OrderORM))
+        await session.execute(delete(PriceTierORM).where(PriceTierORM.id.not_in(original)))
+        for tier_id, active in original.items():
+            await session.execute(
+                update(PriceTierORM).where(PriceTierORM.id == tier_id).values(active=active)
+            )
+
+
+@pytest.fixture()
+def restore_prices(staff_ids):
+    original = run(snapshot_price_tiers())
+    yield
+    run(restore_price_tiers(original))
+
+
+def put_price(client: TestClient, audience: str, base_price, headers=PANEL):
+    return client.put(
+        "/api/estoque/precos",
+        json={"pricing_audience": audience, "base_price": base_price},
+        headers=headers,
+    )
+
+
+def public_tiers(client: TestClient, audience: str) -> list[tuple[int, int | None, float]]:
+    response = client.get("/api/price-tiers", params={"pricing_audience": audience})
+    assert response.status_code == 200
+    return [
+        (tier["min_quantity"], tier["max_quantity"], tier["unit_price"])
+        for tier in response.json()
+    ]
+
+
+def test_admin_sets_base_price_and_tiers_follow_the_rule(client, restore_prices):
+    login(client, "admin")
+    before = run(snapshot_price_tiers())
+
+    response = put_price(client, "MEMBER", "9.00")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["base_price"] == 9.0
+    assert [(t["min_quantity"], t["max_quantity"], t["unit_price"]) for t in body["tiers"]] == [
+        (1, 1, 9.0),
+        (2, 3, 8.5),
+        (4, None, 8.0),
+    ]
+    assert public_tiers(client, "MEMBER") == [(1, 1, 9.0), (2, 3, 8.5), (4, None, 8.0)]
+
+    # Faixas antigas são desativadas, não apagadas (pedidos antigos as referenciam).
+    after = run(snapshot_price_tiers())
+    assert set(before) <= set(after)
+    new_ids = {tier["id"] for tier in body["tiers"]}
+    assert new_ids.isdisjoint(before)
+    assert sum(after.values()) == sum(before.values())
+
+    panel = client.get("/api/estoque/precos")
+    assert panel.status_code == 200
+    tables = {table["pricing_audience"]: table for table in panel.json()}
+    assert tables["MEMBER"]["base_price"] == 9.0
+
+    # O marketplace passa a cobrar pela nova faixa: 2 latas = 2 × 8,50.
+    order = client.post(
+        "/api/orders",
+        json={
+            "buyer_name": "Comprador",
+            "payer_email": "comprador@example.com",
+            "pricing_audience": "MEMBER",
+            "items": [{"product_id": "original", "quantity": 2}],
+        },
+    )
+    assert order.status_code == 201, order.text
+    assert order.json()["total"] == 17.0
+
+
+def test_non_member_has_a_single_price_without_promotion(client, restore_prices):
+    login(client, "admin")
+    assert put_price(client, "NON_MEMBER", "13").status_code == 200
+    assert public_tiers(client, "NON_MEMBER") == [(1, None, 13.0)]
+    # O outro público não muda.
+    assert public_tiers(client, "MEMBER") == [(1, 1, 8.5), (2, 3, 8.0), (4, None, 7.5)]
+
+
+def test_only_admins_change_prices(client, restore_prices):
+    assert put_price(client, "MEMBER", "9.00").status_code == 401
+    login(client, "caixa")
+    assert client.get("/api/estoque/precos").status_code == 200
+    assert put_price(client, "MEMBER", "9.00").status_code == 403
+    login(client, "admin")
+    assert put_price(client, "MEMBER", "9.00", headers={}).status_code == 403
+    assert public_tiers(client, "MEMBER") == [(1, 1, 8.5), (2, 3, 8.0), (4, None, 7.5)]
+
+
+@pytest.mark.parametrize("base_price", ["1.00", "0.50", "0", "-5", "8.555", "1000.01", "abc"])
+def test_invalid_base_price_is_rejected(client, restore_prices, base_price):
+    login(client, "admin")
+    assert put_price(client, "MEMBER", base_price).status_code == 422
+
+
+def test_same_price_is_a_conflict_and_changes_nothing(client, restore_prices):
+    login(client, "admin")
+    before = run(snapshot_price_tiers())
+    assert put_price(client, "MEMBER", "8.50").status_code == 409
+    assert run(snapshot_price_tiers()) == before
+
+
+def test_concurrent_price_changes_leave_a_single_active_table(staff_ids, restore_prices):
+    admin = StaffUser(
+        id=staff_ids["admin"],
+        username="admin",
+        full_name="Usuário admin",
+        role=StaffRole.ADMIN,
+    )
+
+    async def scenario():
+        async def change(base: str):
+            async with AsyncSessionLocal() as session:
+                await update_price_table(
+                    session,
+                    PriceTableUpdate(pricing_audience="MEMBER", base_price=base),
+                    admin,
+                )
+
+        await asyncio.gather(change("9.00"), change("10.00"))
+        async with AsyncSessionLocal() as session:
+            rows = await session.execute(
+                select(PriceTierORM.min_quantity, PriceTierORM.unit_price).where(
+                    PriceTierORM.pricing_audience == "MEMBER",
+                    PriceTierORM.active.is_(True),
+                )
+            )
+            return sorted(rows.all())
+
+    active = run(scenario())
+    assert len(active) == 3
+    assert active[0][1] in (Decimal("9.00"), Decimal("10.00"))

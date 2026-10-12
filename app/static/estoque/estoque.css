@@ -122,6 +122,22 @@ label { display: inline-block; margin: 0 0 8px 2px; font-size: 14px; font-weight
 .kpi span { color: var(--faint); font-size: 12px; }
 .kpi-out b { color: var(--green); }
 
+/* Preços -------------------------------------------------------------------- */
+.prices { margin-bottom: 22px; }
+.price-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.price-card { display: grid; gap: 12px; align-content: start; padding: 16px 18px; border: 1px solid var(--border-soft); border-radius: var(--radius); background: linear-gradient(140deg, var(--surface), #0e1824); }
+.price-card h3 { margin: 0; font-size: 16px; }
+.price-card > p { margin: 0; }
+.price-tiers { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.price-tiers li { display: flex; justify-content: space-between; gap: 12px; padding: 8px 12px; border-radius: 12px; background: var(--surface-soft); color: var(--muted); font-size: 14px; }
+.price-tiers li b { color: var(--text); font-variant-numeric: tabular-nums; }
+.price-tiers .price-empty { color: var(--amber); }
+.price-form { display: grid; }
+.price-input { position: relative; }
+.price-input span { position: absolute; top: 15px; left: 14px; color: var(--muted); font-weight: 700; }
+.price-input input { padding-left: 46px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.price-form .form-error { margin-bottom: 8px; }
+
 .panel-grid { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 22px; align-items: start; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .section-head h2 { margin: 0; font-size: 18px; letter-spacing: -.02em; }

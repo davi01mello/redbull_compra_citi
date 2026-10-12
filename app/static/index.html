@@ -121,6 +121,10 @@
       <button class="outline-button cancel-payment-button" id="cancel-payment" type="button">
         Cancelar pagamento
       </button>
+      <!-- TEMPORÁRIO: confirma o pedido sem Pix real (só aparece com PAYMENT_PROVIDER=mock). Remover antes de produção. -->
+      <button class="outline-button temp-confirm-button hidden" id="temp-confirm-order" type="button">
+        Confirmar pedido (temporário)
+      </button>
 
       <p class="secure-note payment-secure"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>Pagamento seguro</p>
     </section>

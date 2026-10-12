@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#070d16">
   <meta name="robots" content="noindex, nofollow">
   <title>Estoque Red Bull — CITi</title>
-  <link rel="stylesheet" href="/static/estoque/estoque.css?v=20261009-1">
+  <link rel="stylesheet" href="/static/estoque/estoque.css?v=20261011-2">
 </head>
 <body>
   <!-- Login -->
@@ -62,6 +62,13 @@
       <article class="kpi"><small>Entraram hoje</small><b id="kpi-in">—</b><span>reposições lançadas</span></article>
       <article class="kpi"><small>Estoque físico</small><b id="kpi-stock">—</b><span>latas no CITi</span></article>
       <article class="kpi"><small>Disponível no marketplace</small><b id="kpi-available">—</b><span id="kpi-reserved">&nbsp;</span></article>
+    </section>
+
+    <section class="prices" aria-labelledby="prices-title">
+      <div class="section-head">
+        <h2 id="prices-title">Preços</h2>
+      </div>
+      <div id="price-tables" class="price-grid" aria-live="polite"></div>
     </section>
 
     <div class="panel-grid">
@@ -159,6 +166,6 @@
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="/static/estoque/estoque.js?v=20261009-1" defer></script>
+  <script src="/static/estoque/estoque.js?v=20261011-2" defer></script>
 </body>
 </html>

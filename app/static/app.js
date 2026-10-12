@@ -351,6 +351,7 @@ function setPaymentDisplay(variant, label, message = '') {
   const terminal = ['expired', 'failed', 'cancelled'].includes(variant);
   el('copy-pix').disabled = terminal;
   el('cancel-payment').classList.toggle('hidden', terminal);
+  if (terminal) el('temp-confirm-order').classList.add('hidden');
 }
 
 function applyOrderPaymentStatus(order) {
@@ -479,6 +480,7 @@ el('email-form').addEventListener('submit', async event => {
     el('qr-code').src = state.order.payment.qr_code;
     el('pix-code').textContent = state.order.payment.copy_paste;
     el('payment-total').textContent = money(state.order.total);
+    el('temp-confirm-order').classList.toggle('hidden', !state.order.payment.simulated);
     show('payment');
     startPaymentPolling();
   } catch (error) {
@@ -531,6 +533,23 @@ async function cancelCurrentPayment() {
     button.textContent = 'Cancelar pagamento';
   }
 }
+
+// TEMPORÁRIO: confirma o pedido pela rota mock (só existe com PAYMENT_PROVIDER=mock).
+el('temp-confirm-order').addEventListener('click', async () => {
+  if (!state.order) return;
+  const button = el('temp-confirm-order');
+  button.disabled = true;
+  button.textContent = 'Confirmando...';
+  try {
+    await api(`/api/mock/pay/${encodeURIComponent(state.order.payment.txid)}`, { method: 'POST' });
+    await refreshPaymentStatus();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Confirmar pedido (temporário)';
+  }
+});
 
 el('cancel-payment').addEventListener('click', cancelCurrentPayment);
 el('back-shop').addEventListener('click', cancelCurrentPayment);

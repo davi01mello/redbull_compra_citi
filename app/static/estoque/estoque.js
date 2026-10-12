@@ -40,9 +40,22 @@ const MODES = {
   }
 };
 
+const AUDIENCE_LABELS = {
+  MEMBER: 'Membros',
+  NON_MEMBER: 'Não membros'
+};
+// Descontos por lata sobre o preço base, em centavos (mesma regra de app/price_service.py).
+const PRICE_RULE = [
+  { min: 1, max: 1, discount: 0 },
+  { min: 2, max: 3, discount: 50 },
+  { min: 4, max: null, discount: 100 }
+];
+
 const state = {
   user: null,
   products: [],
+  prices: [],
+  savingPrice: false,
   category: '',
   search: '',
   history: [],
@@ -180,6 +193,8 @@ function showPanel(user) {
   el('panel-view').classList.remove('hidden');
   el('user-name').textContent = user.full_name;
   el('user-role').textContent = user.role === 'ADMIN' ? 'Administrador' : 'Operador';
+  // Os cartões de preço dependem do perfil (admin edita, operador só vê).
+  el('price-tables').innerHTML = '';
   refreshAll();
   startRefresh();
 }
@@ -221,7 +236,7 @@ async function onLogout() {
 /* ------------------------------------------------------------ Dados ------ */
 
 async function refreshAll({ automatic = false } = {}) {
-  const tasks = [loadProducts(), loadSummary()];
+  const tasks = [loadProducts(), loadSummary(), loadPrices()];
   // No refresh automático, não descarta páginas carregadas em "Carregar mais".
   if (!automatic || state.history.length <= HISTORY_PAGE) tasks.push(loadHistory());
   await Promise.allSettled(tasks);
@@ -250,6 +265,15 @@ async function loadSummary() {
     el('kpi-reserved').textContent = summary.total_reserved
       ? `${units(summary.total_reserved)} reservadas em PIX`
       : 'nenhuma reserva PIX aberta';
+  } catch (error) {
+    if (error.status !== 401) toast(error.message, true);
+  }
+}
+
+async function loadPrices() {
+  try {
+    state.prices = await api('/precos');
+    renderPrices();
   } catch (error) {
     if (error.status !== 401) toast(error.message, true);
   }
@@ -348,6 +372,139 @@ function renderProducts() {
   el('products').innerHTML = visible.length
     ? visible.map(productCard).join('')
     : `<p class="empty-state">${state.products.length ? 'Nenhum sabor encontrado com esse filtro.' : 'Nenhum sabor cadastrado ainda. Rode sql/seed_sabores.sql para cadastrar o catálogo.'}</p>`;
+}
+
+function tierLabel(min, max) {
+  if (max == null) return min === 1 ? 'Preço por lata' : `${min} ou mais`;
+  if (min === max) return units(min);
+  if (max === min + 1) return `${min} ou ${max} latas`;
+  return `${min} a ${max} latas`;
+}
+
+function tiersHtml(tiers) {
+  if (!tiers.length) return '<li class="price-empty">Nenhuma faixa ativa: este público não consegue comprar.</li>';
+  return tiers.map(tier => (
+    `<li><span>${tierLabel(tier.min_quantity, tier.max_quantity)}</span><b>${money(tier.unit_price)}</b></li>`
+  )).join('');
+}
+
+function priceCard(table) {
+  const audience = escapeHtml(table.pricing_audience);
+  const label = AUDIENCE_LABELS[table.pricing_audience] || audience;
+  const isAdmin = state.user && state.user.role === 'ADMIN';
+  const form = isAdmin ? `
+      <form class="price-form" data-audience="${audience}" novalidate>
+        <label for="price-${audience}">Novo preço de 1 lata (x)</label>
+        <div class="price-input">
+          <span aria-hidden="true">R$</span>
+          <input id="price-${audience}" inputmode="decimal" autocomplete="off" maxlength="7" placeholder="0,00">
+        </div>
+        <p class="preview" data-preview aria-live="polite"></p>
+        <p class="form-error" data-error role="alert"></p>
+        <button type="submit" class="primary-button">
+          <span class="button-label">Salvar preço</span>
+          <span class="button-loader" aria-hidden="true"></span>
+        </button>
+      </form>`
+    : '<p class="muted small">Somente administradores alteram os preços.</p>';
+  return `
+    <article class="price-card" data-audience="${audience}">
+      <h3>${escapeHtml(label)}</h3>
+      <ul class="price-tiers"></ul>
+      ${form}
+    </article>`;
+}
+
+function renderPrices() {
+  const container = el('price-tables');
+  for (const table of state.prices) {
+    let card = container.querySelector(`.price-card[data-audience="${CSS.escape(table.pricing_audience)}"]`);
+    // O cartão é criado uma vez; o refresh automático só troca as faixas e
+    // não apaga o que o administrador está digitando.
+    if (!card) {
+      container.insertAdjacentHTML('beforeend', priceCard(table));
+      card = container.lastElementChild;
+    }
+    card.querySelector('.price-tiers').innerHTML = tiersHtml(table.tiers);
+  }
+}
+
+function parseBasePrice(raw) {
+  const value = String(raw || '').trim().replace(/^R\$\s*/i, '');
+  if (!/^\d{1,4}([.,]\d{1,2})?$/.test(value)) return null;
+  return Math.round(Number(value.replace(',', '.')) * 100);
+}
+
+function priceFromForm(form) {
+  const cents = parseBasePrice(form.querySelector('input').value);
+  if (cents == null) return { error: 'Informe o preço no formato 8,50.' };
+  if (cents <= 100 && form.dataset.audience === 'MEMBER') return { error: 'O preço precisa ser maior que R$ 1,00 (a faixa de 4+ latas desconta R$ 1,00).' };
+  if (cents <= 0) return { error: 'O preço precisa ser maior que zero.' };
+  if (cents > 100000) return { error: 'O preço não pode passar de R$ 1.000,00.' };
+  return { cents };
+}
+
+function syncPriceForm(form) {
+  const input = form.querySelector('input');
+  const preview = form.querySelector('[data-preview]');
+  form.querySelector('[data-error]').textContent = '';
+  input.removeAttribute('aria-invalid');
+  const { cents } = priceFromForm(form);
+  if (cents == null) {
+    preview.innerHTML = '';
+    return;
+  }
+  // A promoção por quantidade é só dos membros; não membros têm preço único, sem simulação.
+  preview.innerHTML = form.dataset.audience === 'MEMBER'
+    ? 'Vai ficar: ' + PRICE_RULE.map(rule => (
+      `${tierLabel(rule.min, rule.max)} <b>${money((cents - rule.discount) / 100)}</b>`
+    )).join(' · ')
+    : '';
+}
+
+async function onSubmitPrice(event) {
+  const form = event.target.closest('.price-form');
+  if (!form) return;
+  event.preventDefault();
+  if (state.savingPrice) return;
+  const input = form.querySelector('input');
+  const errorNode = form.querySelector('[data-error]');
+  const { cents, error } = priceFromForm(form);
+  if (error) {
+    input.setAttribute('aria-invalid', 'true');
+    errorNode.textContent = error;
+    return;
+  }
+  const audience = form.dataset.audience;
+  const label = AUDIENCE_LABELS[audience] || audience;
+  const confirmed = window.confirm(
+    `Alterar o preço para ${label.toLowerCase()} para ${money(cents / 100)} (1 lata)? `
+    + 'Vale para os próximos pedidos do marketplace; pedidos já abertos mantêm o preço antigo.'
+  );
+  if (!confirmed) return;
+
+  const button = form.querySelector('button[type="submit"]');
+  state.savingPrice = true;
+  button.disabled = true;
+  button.classList.add('loading');
+  try {
+    const table = await api('/precos', {
+      method: 'PUT',
+      body: JSON.stringify({ pricing_audience: audience, base_price: (cents / 100).toFixed(2) })
+    });
+    const index = state.prices.findIndex(item => item.pricing_audience === table.pricing_audience);
+    if (index >= 0) state.prices[index] = table;
+    renderPrices();
+    input.value = '';
+    syncPriceForm(form);
+    toast(`Preço para ${label.toLowerCase()} atualizado: 1 lata ${money(table.base_price)}.`);
+  } catch (err) {
+    errorNode.textContent = err.message;
+  } finally {
+    state.savingPrice = false;
+    button.disabled = false;
+    button.classList.remove('loading');
+  }
 }
 
 function historyItem(movement) {
@@ -609,6 +766,12 @@ function bindEvents() {
     loadHistory();
   });
   el('history-more').addEventListener('click', () => loadHistory(true));
+
+  el('price-tables').addEventListener('submit', onSubmitPrice);
+  el('price-tables').addEventListener('input', event => {
+    const form = event.target.closest('.price-form');
+    if (form) syncPriceForm(form);
+  });
 
   const dialog = el('movement-dialog');
   el('movement-form').addEventListener('submit', onSubmitMovement);
