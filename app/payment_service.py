@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+import asyncio
 import hashlib
 import logging
 from uuid import UUID, uuid4
@@ -531,6 +532,50 @@ async def _release_locked_reservation(
     order.reservation_status = ReservationStatus.RELEASED
 
 
+async def _unresolved_release_failures(
+    db: AsyncSession,
+    order_ids: list[UUID],
+) -> set[UUID]:
+    """Pedidos já encaminhados para revisão por falha na liberação da reserva.
+
+    Evita repetir a mesma falha a cada ciclo. Depois de corrigir o problema,
+    marque a revisão como resolvida (resolved_at) para o pedido voltar à fila.
+    """
+    if not order_ids:
+        return set()
+    async with db.begin():
+        result = await db.execute(
+            select(ManualReviewORM.order_id).where(
+                ManualReviewORM.order_id.in_(order_ids),
+                ManualReviewORM.reason
+                == ManualReviewReason.RESERVATION_RELEASE_FAILED.value,
+                ManualReviewORM.resolved_at.is_(None),
+            )
+        )
+        return set(result.scalars())
+
+
+async def _flag_release_failure(
+    db: AsyncSession,
+    order_id: UUID,
+    exc: Exception,
+) -> None:
+    try:
+        async with db.begin():
+            await _flag_manual_review(
+                db,
+                order_id,
+                ManualReviewReason.RESERVATION_RELEASE_FAILED,
+                f"Falha ao liberar a reserva na expiração: {type(exc).__name__}",
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Não foi possível registrar a revisão manual: order_id=%s", order_id
+        )
+
+
 async def reconcile_pending_mercadopago_payments(
     db: AsyncSession,
     provider: PaymentProvider,
@@ -716,41 +761,58 @@ async def expire_due_payments(
                     continue
         candidate_order_ids.append(order_id)
 
+    flagged_order_ids = await _unresolved_release_failures(db, candidate_order_ids)
+
     expired = 0
     for order_id in candidate_order_ids:
-        async with db.begin():
-            order = (
-                await db.execute(
-                    select(OrderORM)
-                    .where(OrderORM.id == order_id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            payment = (
-                await db.execute(
-                    select(PaymentORM)
-                    .where(PaymentORM.order_id == order_id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            ).scalar_one_or_none()
-            if (
-                order is None
-                or payment is None
-                or order.status == OrderStatus.PAID
-                or payment.status
-                not in {PaymentStatus.CREATING, PaymentStatus.WAITING_PAYMENT}
-                or payment.expires_at is None
-                or payment.expires_at > cutoff
-            ):
-                continue
+        if order_id in flagged_order_ids:
+            continue
+        try:
+            async with db.begin():
+                order = (
+                    await db.execute(
+                        select(OrderORM)
+                        .where(OrderORM.id == order_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                payment = (
+                    await db.execute(
+                        select(PaymentORM)
+                        .where(PaymentORM.order_id == order_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if (
+                    order is None
+                    or payment is None
+                    or order.status == OrderStatus.PAID
+                    or payment.status
+                    not in {PaymentStatus.CREATING, PaymentStatus.WAITING_PAYMENT}
+                    or payment.expires_at is None
+                    or payment.expires_at > cutoff
+                ):
+                    continue
 
-            await _release_locked_reservation(db, order)
+                await _release_locked_reservation(db, order)
 
-            payment.status = PaymentStatus.EXPIRED
-            payment.updated_at = cutoff
-            await db.flush()
-            expired += 1
+                payment.status = PaymentStatus.EXPIRED
+                payment.updated_at = cutoff
+                await db.flush()
+                expired += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A transação deste pedido já sofreu rollback. Isola a falha para
+            # que os demais pedidos vencidos do ciclo continuem sendo liberados.
+            logger.exception(
+                "Falha ao liberar reserva de cobrança vencida; "
+                "encaminhada para revisão manual: order_id=%s error=%s",
+                order_id,
+                type(exc).__name__,
+            )
+            await _flag_release_failure(db, order_id, exc)
 
     return expired
 

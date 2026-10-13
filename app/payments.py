@@ -136,7 +136,10 @@ class MockPaymentProvider:
             raise PaymentProviderError("A chave de idempotência é obrigatória")
         current = self._orders.get(order_id)
         if current is None:
-            raise PaymentProviderError("Order mock não encontrada")
+            # O mock guarda as cobranças só em memória: após reiniciar o
+            # servidor não há mais nada para cancelar. Tratar como já
+            # cancelada permite liberar a reserva local em vez de prendê-la.
+            return
         self._orders[order_id] = replace(current, status="CANCELLED")
 
     async def aclose(self) -> None:
