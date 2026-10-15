@@ -487,3 +487,91 @@ def test_webhook_anomalies_are_listed_for_manual_review(
 
     assert result.outcome == expected_outcome
     assert response.status_code == 404
+
+
+def test_mock_charge_lost_after_restart_still_releases_reservation():
+    """O mock guarda cobranças em memória; após reiniciar o servidor a
+    reserva vencida precisa ser liberada em vez de ficar presa."""
+    from app.config import settings
+    from app.payments import MockPaymentProvider
+
+    async def scenario():
+        await reset_database()
+        order = await create_order(MockPaymentProvider(settings))
+        cutoff = datetime.now(UTC)
+        await make_due(order.id, cutoff)
+        restarted = MockPaymentProvider(settings)  # memória perdida
+        async with AsyncSessionLocal() as session:
+            expired = await expire_due_payments(session, cutoff, provider=restarted)
+        state = await load_state(order.id)
+        await engine.dispose()
+        return expired, state
+
+    expired, state = asyncio.run(scenario())
+    assert expired == 1
+    assert state["payment_status"] == PaymentStatus.EXPIRED
+    assert state["reservation_status"] == ReservationStatus.RELEASED
+    assert state["reserved_stock"] == 0
+
+
+def test_inconsistent_reservation_does_not_block_other_expirations():
+    async def scenario():
+        await reset_database()
+        provider = ExpirationTestProvider()
+        broken = await create_order(provider, "Inconsistente")  # produto "original"
+        async with AsyncSessionLocal() as session:
+            healthy = await create_order_with_payment(
+                session,
+                OrderCreate(
+                    buyer_name="Normal",
+                    payer_email="comprador@example.com",
+                    pricing_audience=PricingAudience.MEMBER,
+                    items=[OrderItemInput(product_id="tropical", quantity=1)],
+                ),
+                provider,
+            )
+        cutoff = datetime.now(UTC)
+        # O inconsistente vence antes e, portanto, é processado primeiro.
+        await make_due(broken.id, cutoff - timedelta(seconds=30))
+        await make_due(healthy.id, cutoff)
+        async with AsyncSessionLocal() as session, session.begin():
+            await session.execute(
+                update(ProductORM)
+                .where(ProductORM.id == "original")
+                .values(reserved_stock=0)  # menor que o exigido pelo pedido
+            )
+        async with AsyncSessionLocal() as session:
+            first = await expire_due_payments(session, cutoff, provider=provider)
+        async with AsyncSessionLocal() as session:
+            second = await expire_due_payments(session, cutoff, provider=provider)
+        async with AsyncSessionLocal() as session:
+            reviews = (
+                await session.execute(
+                    select(ManualReviewORM.order_id, ManualReviewORM.reason)
+                )
+            ).all()
+            healthy_order = (
+                await session.execute(
+                    select(OrderORM).where(OrderORM.id == healthy.id)
+                )
+            ).scalar_one()
+            broken_order = (
+                await session.execute(
+                    select(OrderORM).where(OrderORM.id == broken.id)
+                )
+            ).scalar_one()
+        await engine.dispose()
+        return broken.id, first, second, reviews, healthy_order, broken_order
+
+    broken_id, first, second, reviews, healthy_order, broken_order = asyncio.run(
+        scenario()
+    )
+    # O pedido normal é liberado mesmo com o inconsistente falhando antes dele.
+    assert first == 1
+    assert healthy_order.reservation_status == ReservationStatus.RELEASED
+    # O inconsistente fica intacto e vai para revisão manual, sem se repetir.
+    assert broken_order.reservation_status == ReservationStatus.ACTIVE
+    assert [(r[0], r[1]) for r in reviews] == [
+        (broken_id, "RESERVATION_RELEASE_FAILED")
+    ]
+    assert second == 0

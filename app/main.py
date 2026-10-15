@@ -34,6 +34,7 @@ from .payment_service import (
     expire_due_payments,
     process_mercadopago_payment,
 )
+from .stock_panel import router as stock_panel_router
 from .store import store
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -82,6 +83,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Red Bull PDV — MVP", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+app.include_router(stock_panel_router)
 
 
 @app.get("/", include_in_schema=False)

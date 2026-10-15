@@ -1,0 +1,4629 @@
+From df7e732abb3f94f1ab14c50a0ccf845c9f3d0546 Mon Sep 17 00:00:00 2001
+From: Felipe Komata <felipe.komata@citi.org.br>
+Date: Thu, 8 Oct 2026 22:28:15 -0300
+Subject: [PATCH] =?UTF-8?q?feat(estoque):=20controle=20de=20estoque=20com?=
+ =?UTF-8?q?=20login,=20painel=20e=20livro-raz=C3=A3o=20no=20banco?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Recria o controle de estoque perdido, integrado ao marketplace:
+
+- Migration c3f8a1d27b54 (após 7e03d1bf5a42): staff_users, staff_sessions,
+  stock_movements, trigger trg_products_stock_ledger e views de consulta.
+  Toda alteração de products.stock fica registrada (quem comprou, quantas
+  latas, horário, pedido, operador). Não altera users, stock_adjustments
+  nem as colunas legadas de products.
+- Vendas pagas no marketplace (webhook, reconciliação e mock) informam o
+  pedido ao livro-razão na mesma transação do pagamento.
+- Painel /estoque: login, todos os sabores com as imagens do PDV, botões
+  de entrada/saída, ajuste de inventário (admin) e histórico.
+- CLI scripts/create_staff_user.py, SQL puro (schema, seed de sabores e
+  relatórios) e plano de ação em docs/plano-acao-estoque.md.
+- 28 testes novos; suíte completa com 113 testes passando.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WeandBcgBXZvWiPSukNHW1
+---
+ .env.example                                  |   7 +
+ README.md                                     |  22 +-
+ .../c3f8a1d27b54_add_stock_control_ledger.py  | 399 +++++++++++
+ app/db/models.py                              | 187 +++++
+ app/main.py                                   |   2 +
+ app/models.py                                 | 157 ++++-
+ app/payment_service.py                        |  10 +
+ app/staff_auth.py                             | 370 ++++++++++
+ app/static/estoque/estoque.css                | 264 +++++++
+ app/static/estoque/estoque.js                 | 642 ++++++++++++++++++
+ app/stock_panel.py                            | 159 +++++
+ app/stock_service.py                          | 363 ++++++++++
+ app/store.py                                  |   9 +
+ app/templates/estoque.html                    | 164 +++++
+ docs/plano-acao-estoque.md                    | 188 +++++
+ scripts/create_staff_user.py                  | 164 +++++
+ scripts/export_stock_schema_sql.py            |  57 ++
+ sql/consultas_estoque.sql                     | 126 ++++
+ sql/estoque_schema.sql                        | 330 +++++++++
+ sql/seed_sabores.sql                          |  92 +++
+ tests/test_migrations.py                      |   3 +-
+ tests/test_stock_panel.py                     | 582 ++++++++++++++++
+ tests/test_stock_schema_sql.py                |  38 ++
+ 23 files changed, 4332 insertions(+), 3 deletions(-)
+ create mode 100644 app/db/migrations/versions/c3f8a1d27b54_add_stock_control_ledger.py
+ create mode 100644 app/staff_auth.py
+ create mode 100644 app/static/estoque/estoque.css
+ create mode 100644 app/static/estoque/estoque.js
+ create mode 100644 app/stock_panel.py
+ create mode 100644 app/stock_service.py
+ create mode 100644 app/templates/estoque.html
+ create mode 100644 docs/plano-acao-estoque.md
+ create mode 100644 scripts/create_staff_user.py
+ create mode 100644 scripts/export_stock_schema_sql.py
+ create mode 100644 sql/consultas_estoque.sql
+ create mode 100644 sql/estoque_schema.sql
+ create mode 100644 sql/seed_sabores.sql
+ create mode 100644 tests/test_stock_panel.py
+ create mode 100644 tests/test_stock_schema_sql.py
+
+diff --git a/.env.example b/.env.example
+index 16a98cb..95c0177 100644
+--- a/.env.example
++++ b/.env.example
+@@ -8,3 +8,10 @@ CHARGE_EXPIRES_IN=1800
+ # Tempo da tela/reserva local (10 minutos). O Mercado Pago exige ao menos 30 minutos.
+ PAYMENT_CHECKOUT_EXPIRES_IN=600
+ PAYMENT_EXPIRATION_CHECK_INTERVAL=5
++# Painel de estoque (/estoque)
++# Em produção (HTTPS) mantenha true; em http://localhost use false.
++STOCK_SESSION_COOKIE_SECURE=true
++STOCK_SESSION_TTL_HOURS=12
++STOCK_LOGIN_MAX_ATTEMPTS=5
++STOCK_LOGIN_LOCK_MINUTES=15
++STOCK_TIMEZONE=America/Recife
+diff --git a/README.md b/README.md
+index aa83124..dcf5b88 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,7 @@ O e-mail do pagador não é uma variável de ambiente. Não configure `MERCADO_P
+ 
+ Após o pagamento, o webhook assinado consulta `GET /v1/orders/{provider_order_id}`. A confirmação altera pedido, pagamento, reserva e estoque na mesma transação, com locks de linha e verificações de estado para impedir desconto duplicado. Uma reconciliação periódica consulta pagamentos pendentes antes da expiração, cobrindo webhooks perdidos ou consultas precoces.
+ 
+-Nunca corrija somente `orders.status` nem desconte estoque diretamente por SQL. Use o comando de reconciliação, que reutiliza a transação central.
++Nunca corrija somente `orders.status` nem desconte estoque diretamente por SQL. Use o comando de reconciliação, que reutiliza a transação central. Entradas, saídas manuais e ajustes de estoque são feitos pelo painel `/estoque`.
+ 
+ ## Configuração
+ 
+@@ -43,6 +43,26 @@ uvicorn app.main:app --reload
+ 
+ A aplicação fica em `http://127.0.0.1:8000` e a documentação em `/docs`.
+ 
++## Controle de estoque (`/estoque`)
++
++Painel com login para operadores registrarem entradas e saídas de Red Bull. Ele lista todos os sabores cadastrados em `products` (os mesmos do marketplace), mostra estoque físico, reservas PIX abertas e o que está disponível no PDV, e tem os botões **− Saída** (venda manual ou perda) e **+ Entrada** (reposição). Administradores também podem lançar um **ajuste de inventário** (contagem física).
++
++Toda alteração de `products.stock` fica registrada em `stock_movements` pelo trigger `trg_products_stock_ledger`, inclusive as vendas pagas no marketplace: quem comprou (nome e e-mail), quantas latas saíram, horário, pedido, preço unitário e operador. Alterações feitas direto por SQL também são registradas, como `UNTRACKED`. Use o painel para repor ou corrigir estoque; não faça `UPDATE products SET stock` manual.
++
++Primeiro acesso:
++
++```bash
++alembic upgrade head                      # cria staff_users, staff_sessions, stock_movements, trigger e views
++psql "$URL_DO_BANCO" -f sql/seed_sabores.sql   # opcional: cadastra os 12 sabores com estoque 0
++python -m scripts.create_staff_user --username seu.usuario --name "Seu Nome" --role ADMIN
++```
++
++Depois acesse `http://127.0.0.1:8000/estoque`. Em desenvolvimento sem HTTPS, defina `STOCK_SESSION_COOKIE_SECURE=false`.
++
++- Modelo de dados em SQL puro: `sql/estoque_schema.sql` (idêntico à revisão `c3f8a1d27b54`).
++- Relatórios prontos (saídas do dia, quem comprou, ranking de sabores, integridade): `sql/consultas_estoque.sql`.
++- Plano de ação e fluxo completo: `docs/plano-acao-estoque.md`.
++
+ ## Alembic e banco institucional
+ 
+ Na auditoria de 2026-08-11, o banco institucional estava em `e91a7c4d2f30`; o histórico local anterior tinha `a6c42f1d9b73` como head. O banco também contém `users` e `stock_adjustments`, tabelas externas ao ORM/histórico deste serviço, que devem ser preservadas. As colunas históricas `products.description`, `products.color` e `products.price`, presentes em instalações criadas do zero mas ausentes no banco institucional, também são preservadas. Esses objetos estão marcados como não gerenciados no autogenerate para impedir propostas destrutivas.
+diff --git a/app/db/migrations/versions/c3f8a1d27b54_add_stock_control_ledger.py b/app/db/migrations/versions/c3f8a1d27b54_add_stock_control_ledger.py
+new file mode 100644
+index 0000000..04de7a0
+--- /dev/null
++++ b/app/db/migrations/versions/c3f8a1d27b54_add_stock_control_ledger.py
+@@ -0,0 +1,399 @@
++"""add stock control ledger, staff users and sessions
++
++Recria no banco o controle de estoque do marketplace:
++
++- ``staff_users``: operadores do painel de estoque (login);
++- ``staff_sessions``: sessões de login do painel (token guardado só como hash);
++- ``stock_movements``: livro-razão imutável de toda alteração em
++  ``products.stock`` — quem comprou, quantas unidades saíram e o horário;
++- ``fn_stock_movements_ledger`` + ``trg_products_stock_ledger``: o próprio
++  banco registra a movimentação sempre que ``products.stock`` muda, inclusive
++  em vendas pagas pelo marketplace e em alterações feitas direto via SQL;
++- views ``vw_estoque_atual``, ``vw_movimentacoes_estoque`` e
++  ``vw_saidas_estoque`` para consulta.
++
++Não altera ``users``, ``stock_adjustments`` nem as colunas legadas
++``products.description``/``color``/``price``. Todos os comandos são
++idempotentes (``IF NOT EXISTS`` / ``CREATE OR REPLACE``), então a revisão
++também funciona em bancos onde ``sql/estoque_schema.sql`` já foi aplicado.
++
++O downgrade apaga o histórico de movimentações e os operadores. Faça backup
++antes de executá-lo em qualquer banco real.
++
++Revision ID: c3f8a1d27b54
++Revises: 7e03d1bf5a42
++Create Date: 2026-10-09
++"""
++
++from typing import Sequence, Union
++
++from alembic import op
++
++
++revision: str = "c3f8a1d27b54"
++down_revision: Union[str, Sequence[str], None] = "7e03d1bf5a42"
++branch_labels: Union[str, Sequence[str], None] = None
++depends_on: Union[str, Sequence[str], None] = None
++
++
++# Cada item é um comando SQL completo. A mesma lista gera
++# sql/estoque_schema.sql (ver tests/test_stock_schema_sql.py).
++UPGRADE_STATEMENTS: tuple[str, ...] = (
++    # 1) Operadores do painel de estoque ------------------------------------
++    """
++CREATE TABLE IF NOT EXISTS staff_users (
++    id                     BIGSERIAL    PRIMARY KEY,
++    username               VARCHAR(50)  NOT NULL,
++    full_name              VARCHAR(120) NOT NULL,
++    password_hash          VARCHAR(255) NOT NULL,
++    role                   VARCHAR(20)  NOT NULL DEFAULT 'OPERADOR',
++    active                 BOOLEAN      NOT NULL DEFAULT true,
++    failed_login_attempts  INTEGER      NOT NULL DEFAULT 0,
++    locked_until           TIMESTAMPTZ,
++    last_login_at          TIMESTAMPTZ,
++    created_at             TIMESTAMPTZ  NOT NULL DEFAULT now(),
++    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT now(),
++    CONSTRAINT uq_staff_users_username UNIQUE (username),
++    CONSTRAINT ck_staff_users_role CHECK (role IN ('ADMIN', 'OPERADOR')),
++    CONSTRAINT ck_staff_users_username_format
++        CHECK (username ~ '^[a-z0-9._-]{3,50}$'),
++    CONSTRAINT ck_staff_users_failed_login_attempts
++        CHECK (failed_login_attempts >= 0)
++)
++""",
++    """
++COMMENT ON TABLE staff_users IS
++    'Operadores do painel de estoque. Senha guardada apenas como hash scrypt.'
++""",
++    # 2) Sessões de login ----------------------------------------------------
++    """
++CREATE TABLE IF NOT EXISTS staff_sessions (
++    id             BIGSERIAL    PRIMARY KEY,
++    staff_user_id  BIGINT       NOT NULL,
++    token_hash     VARCHAR(64)  NOT NULL,
++    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
++    expires_at     TIMESTAMPTZ  NOT NULL,
++    revoked_at     TIMESTAMPTZ,
++    user_agent     VARCHAR(255),
++    ip_address     VARCHAR(45),
++    CONSTRAINT uq_staff_sessions_token_hash UNIQUE (token_hash),
++    CONSTRAINT fk_staff_sessions_staff_user_id
++        FOREIGN KEY (staff_user_id) REFERENCES staff_users (id) ON DELETE CASCADE
++)
++""",
++    """
++CREATE INDEX IF NOT EXISTS ix_staff_sessions_staff_user_id
++    ON staff_sessions (staff_user_id)
++""",
++    """
++COMMENT ON TABLE staff_sessions IS
++    'Sessões do painel de estoque. O token do cookie nunca é salvo, só o SHA-256.'
++""",
++    # 3) Livro-razão de estoque ----------------------------------------------
++    """
++CREATE TABLE IF NOT EXISTS stock_movements (
++    id                    BIGSERIAL      PRIMARY KEY,
++    product_id            VARCHAR(50)    NOT NULL,
++    product_name          VARCHAR(120)   NOT NULL,
++    movement_type         VARCHAR(30)    NOT NULL,
++    source                VARCHAR(20)    NOT NULL,
++    quantity              INTEGER        NOT NULL,
++    delta                 INTEGER        NOT NULL,
++    stock_before          INTEGER        NOT NULL,
++    stock_after           INTEGER        NOT NULL,
++    reserved_stock_after  INTEGER        NOT NULL,
++    order_id              UUID,
++    staff_user_id         BIGINT,
++    buyer_name            VARCHAR(80),
++    buyer_email           VARCHAR(254),
++    unit_price            NUMERIC(10, 2),
++    note                  VARCHAR(500),
++    db_user               VARCHAR(63)    NOT NULL DEFAULT session_user,
++    created_at            TIMESTAMPTZ    NOT NULL DEFAULT now(),
++    CONSTRAINT fk_stock_movements_product_id
++        FOREIGN KEY (product_id) REFERENCES products (id),
++    CONSTRAINT fk_stock_movements_order_id
++        FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE SET NULL,
++    CONSTRAINT fk_stock_movements_staff_user_id
++        FOREIGN KEY (staff_user_id) REFERENCES staff_users (id),
++    CONSTRAINT ck_stock_movements_type CHECK (
++        movement_type IN (
++            'INITIAL_STOCK', 'RESTOCK', 'MANUAL_SALE', 'LOSS',
++            'ADJUSTMENT', 'MARKETPLACE_SALE', 'UNTRACKED'
++        )
++    ),
++    CONSTRAINT ck_stock_movements_source
++        CHECK (source IN ('PAINEL', 'MARKETPLACE', 'BANCO')),
++    CONSTRAINT ck_stock_movements_quantity
++        CHECK (quantity > 0 AND quantity = abs(delta)),
++    CONSTRAINT ck_stock_movements_balance
++        CHECK (stock_after = stock_before + delta),
++    CONSTRAINT ck_stock_movements_direction CHECK (
++        (movement_type IN ('INITIAL_STOCK', 'RESTOCK') AND delta > 0)
++        OR (movement_type IN ('MANUAL_SALE', 'LOSS', 'MARKETPLACE_SALE') AND delta < 0)
++        OR movement_type IN ('ADJUSTMENT', 'UNTRACKED')
++    ),
++    CONSTRAINT ck_stock_movements_manual_sale_buyer
++        CHECK (movement_type <> 'MANUAL_SALE' OR buyer_name IS NOT NULL)
++)
++""",
++    """
++CREATE INDEX IF NOT EXISTS ix_stock_movements_product_id_created_at
++    ON stock_movements (product_id, created_at)
++""",
++    """
++CREATE INDEX IF NOT EXISTS ix_stock_movements_created_at
++    ON stock_movements (created_at)
++""",
++    """
++CREATE INDEX IF NOT EXISTS ix_stock_movements_order_id
++    ON stock_movements (order_id)
++""",
++    """
++CREATE INDEX IF NOT EXISTS ix_stock_movements_staff_user_id
++    ON stock_movements (staff_user_id)
++""",
++    """
++COMMENT ON TABLE stock_movements IS
++    'Livro-razão de estoque: uma linha por alteração de products.stock. Preenchido pelo trigger trg_products_stock_ledger.'
++""",
++    # 4) Trigger: o banco registra toda alteração de products.stock ----------
++    #
++    # O contexto (tipo, operador, comprador, pedido) vem da configuração
++    # transacional "redbull.stock_context", definida pela aplicação com
++    # set_config(..., true) na mesma transação que altera o estoque. Sem
++    # contexto, a linha é registrada como UNTRACKED com origem BANCO.
++    # O trigger nunca bloqueia uma venda: contexto inválido vira UNTRACKED.
++    """
++CREATE OR REPLACE FUNCTION fn_stock_movements_ledger()
++RETURNS trigger
++LANGUAGE plpgsql
++SECURITY DEFINER
++AS $fn$
++DECLARE
++    v_raw          text;
++    v_ctx          jsonb := '{}'::jsonb;
++    v_before       integer;
++    v_delta        integer;
++    v_type         text;
++    v_source       text;
++    v_order_id     uuid;
++    v_staff_id     bigint;
++    v_buyer_name   text;
++    v_buyer_email  text;
++    v_unit_price   numeric(10, 2);
++    v_note         text;
++BEGIN
++    IF TG_OP = 'INSERT' THEN
++        v_before := 0;
++    ELSE
++        v_before := OLD.stock;
++    END IF;
++    v_delta := NEW.stock - v_before;
++    IF v_delta = 0 THEN
++        RETURN NEW;
++    END IF;
++
++    -- Cada parte do contexto é lida isoladamente: um campo ruim não apaga
++    -- os demais (principalmente o operador) e nunca aborta a transação.
++    BEGIN
++        v_raw := current_setting('redbull.stock_context', true);
++        IF v_raw IS NOT NULL AND btrim(v_raw) <> '' THEN
++            v_ctx := v_raw::jsonb;
++        END IF;
++    EXCEPTION WHEN others THEN
++        v_ctx := '{}'::jsonb;
++        v_note := '[contexto de estoque inválido ignorado]';
++    END;
++    IF jsonb_typeof(v_ctx) IS DISTINCT FROM 'object' THEN
++        v_ctx := '{}'::jsonb;
++    END IF;
++
++    v_type := v_ctx ->> 'movement_type';
++    v_source := v_ctx ->> 'source';
++    v_buyer_name := left(NULLIF(btrim(v_ctx ->> 'buyer_name'), ''), 80);
++    v_buyer_email := left(NULLIF(btrim(v_ctx ->> 'buyer_email'), ''), 254);
++    v_note := concat_ws(' ', v_note, NULLIF(btrim(v_ctx ->> 'note'), ''));
++    BEGIN
++        v_order_id := NULLIF(v_ctx ->> 'order_id', '')::uuid;
++    EXCEPTION WHEN others THEN
++        v_order_id := NULL;
++    END;
++    BEGIN
++        v_staff_id := NULLIF(v_ctx ->> 'staff_user_id', '')::bigint;
++    EXCEPTION WHEN others THEN
++        v_staff_id := NULL;
++    END;
++    BEGIN
++        v_unit_price := NULLIF(v_ctx ->> 'unit_price', '')::numeric(10, 2);
++    EXCEPTION WHEN others THEN
++        v_unit_price := NULL;
++    END;
++
++    IF v_type IS NULL THEN
++        v_type := CASE WHEN TG_OP = 'INSERT' THEN 'INITIAL_STOCK' ELSE 'UNTRACKED' END;
++    END IF;
++    IF v_source IS NULL OR v_source NOT IN ('PAINEL', 'MARKETPLACE', 'BANCO') THEN
++        v_source := 'BANCO';
++    END IF;
++
++    IF NOT (
++        (v_type IN ('INITIAL_STOCK', 'RESTOCK') AND v_delta > 0)
++        OR (v_type IN ('MANUAL_SALE', 'LOSS', 'MARKETPLACE_SALE') AND v_delta < 0)
++        OR v_type IN ('ADJUSTMENT', 'UNTRACKED')
++    ) OR (v_type = 'MANUAL_SALE' AND v_buyer_name IS NULL) THEN
++        v_note := concat_ws(' ', '[tipo ' || left(v_type, 40) || ' incompatível com a alteração]', v_note);
++        v_type := 'UNTRACKED';
++    END IF;
++
++    IF v_order_id IS NOT NULL THEN
++        SELECT COALESCE(v_buyer_name, left(o.buyer_name, 80)),
++               COALESCE(v_buyer_email, left(o.payer_email, 254))
++          INTO v_buyer_name, v_buyer_email
++          FROM orders AS o
++         WHERE o.id = v_order_id;
++        IF NOT FOUND THEN
++            v_order_id := NULL;
++        ELSE
++            SELECT COALESCE(v_unit_price, max(item.unit_price))
++              INTO v_unit_price
++              FROM order_items AS item
++             WHERE item.order_id = v_order_id
++               AND item.product_id = NEW.id;
++        END IF;
++    END IF;
++
++    IF v_staff_id IS NOT NULL
++       AND NOT EXISTS (SELECT 1 FROM staff_users WHERE id = v_staff_id) THEN
++        v_staff_id := NULL;
++    END IF;
++
++    INSERT INTO stock_movements (
++        product_id, product_name, movement_type, source,
++        quantity, delta, stock_before, stock_after, reserved_stock_after,
++        order_id, staff_user_id, buyer_name, buyer_email, unit_price, note, db_user
++    ) VALUES (
++        NEW.id, left(NEW.name, 120), v_type, v_source,
++        abs(v_delta), v_delta, v_before, NEW.stock, NEW.reserved_stock,
++        v_order_id, v_staff_id, v_buyer_name, v_buyer_email, v_unit_price,
++        left(NULLIF(v_note, ''), 500), left(session_user, 63)
++    );
++    RETURN NEW;
++END;
++$fn$
++""",
++    # SECURITY DEFINER: o trigger grava com os privilégios do dono da função,
++    # então uma role da aplicação sem GRANT em stock_movements não aborta a
++    # venda. O search_path fica fixo no schema atual para não resolver nomes
++    # em schemas/tabelas temporárias de quem dispara o trigger.
++    """
++DO $sp$
++BEGIN
++    EXECUTE format(
++        'ALTER FUNCTION fn_stock_movements_ledger() SET search_path = %I, pg_temp',
++        current_schema()
++    );
++END
++$sp$
++""",
++    """
++REVOKE ALL ON FUNCTION fn_stock_movements_ledger() FROM PUBLIC
++""",
++    """
++DROP TRIGGER IF EXISTS trg_products_stock_ledger ON products
++""",
++    """
++CREATE TRIGGER trg_products_stock_ledger
++    AFTER INSERT OR UPDATE OF stock ON products
++    FOR EACH ROW
++    EXECUTE FUNCTION fn_stock_movements_ledger()
++""",
++    # 5) Views de consulta -----------------------------------------------------
++    """
++CREATE OR REPLACE VIEW vw_estoque_atual AS
++SELECT
++    p.id                         AS produto_id,
++    p.name                       AS sabor,
++    p.category                   AS categoria,
++    p.stock                      AS estoque_fisico,
++    p.reserved_stock             AS reservado_pix,
++    p.stock - p.reserved_stock   AS disponivel_marketplace,
++    ultima.created_at            AS ultima_movimentacao
++FROM products AS p
++LEFT JOIN LATERAL (
++    SELECT m.created_at
++      FROM stock_movements AS m
++     WHERE m.product_id = p.id
++     ORDER BY m.created_at DESC, m.id DESC
++     LIMIT 1
++) AS ultima ON true
++""",
++    """
++CREATE OR REPLACE VIEW vw_movimentacoes_estoque AS
++SELECT
++    m.id,
++    m.created_at                                  AS horario_utc,
++    (m.created_at AT TIME ZONE 'America/Recife')  AS horario_recife,
++    m.product_id                                  AS produto_id,
++    m.product_name                                AS sabor,
++    m.movement_type                               AS tipo,
++    CASE m.movement_type
++        WHEN 'INITIAL_STOCK'    THEN 'Estoque inicial'
++        WHEN 'RESTOCK'          THEN 'Reposição'
++        WHEN 'MANUAL_SALE'      THEN 'Venda manual'
++        WHEN 'LOSS'             THEN 'Perda/avaria'
++        WHEN 'ADJUSTMENT'       THEN 'Ajuste de inventário'
++        WHEN 'MARKETPLACE_SALE' THEN 'Venda no marketplace'
++        ELSE 'Alteração sem contexto'
++    END                                           AS tipo_descricao,
++    m.source                                      AS origem,
++    CASE WHEN m.delta < 0 THEN 'SAIDA' ELSE 'ENTRADA' END AS direcao,
++    m.quantity                                    AS quantidade,
++    m.delta,
++    m.stock_before                                AS estoque_antes,
++    m.stock_after                                 AS estoque_depois,
++    m.buyer_name                                  AS comprador,
++    m.buyer_email                                 AS email_comprador,
++    m.order_id                                    AS pedido_id,
++    o.paid_at                                     AS pago_em,
++    m.unit_price                                  AS preco_unitario,
++    m.unit_price * m.quantity                     AS valor_total,
++    su.username                                   AS operador_usuario,
++    su.full_name                                  AS operador_nome,
++    m.note                                        AS observacao,
++    m.db_user                                     AS usuario_banco
++FROM stock_movements AS m
++LEFT JOIN orders AS o ON o.id = m.order_id
++LEFT JOIN staff_users AS su ON su.id = m.staff_user_id
++""",
++    # Todas as reduções de estoque. Para vendas, filtre por tipo
++    # (MARKETPLACE_SALE / MANUAL_SALE); ajustes negativos também aparecem aqui.
++    """
++CREATE OR REPLACE VIEW vw_saidas_estoque AS
++SELECT *
++  FROM vw_movimentacoes_estoque
++ WHERE delta < 0
++""",
++)
++
++
++DOWNGRADE_STATEMENTS: tuple[str, ...] = (
++    "DROP VIEW IF EXISTS vw_saidas_estoque",
++    "DROP VIEW IF EXISTS vw_movimentacoes_estoque",
++    "DROP VIEW IF EXISTS vw_estoque_atual",
++    "DROP TRIGGER IF EXISTS trg_products_stock_ledger ON products",
++    "DROP FUNCTION IF EXISTS fn_stock_movements_ledger()",
++    "DROP TABLE IF EXISTS stock_movements",
++    "DROP TABLE IF EXISTS staff_sessions",
++    "DROP TABLE IF EXISTS staff_users",
++)
++
++
++def upgrade() -> None:
++    for statement in UPGRADE_STATEMENTS:
++        op.execute(statement)
++
++
++def downgrade() -> None:
++    for statement in DOWNGRADE_STATEMENTS:
++        op.execute(statement)
+diff --git a/app/db/models.py b/app/db/models.py
+index ca42204..1c6a06e 100644
+--- a/app/db/models.py
++++ b/app/db/models.py
+@@ -3,11 +3,13 @@ from decimal import Decimal
+ from uuid import UUID
+ 
+ from sqlalchemy import (
++    BigInteger,
+     Boolean,
+     CheckConstraint,
+     DateTime,
+     Enum,
+     ForeignKey,
++    Index,
+     Integer,
+     Numeric,
+     String,
+@@ -252,3 +254,188 @@ class ManualReviewORM(Base):
+     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+ 
+     order: Mapped[OrderORM] = relationship(back_populates="manual_reviews")
++
++
++class StaffUserORM(Base):
++    """Operador do painel de estoque (tabela criada em c3f8a1d27b54)."""
++
++    __tablename__ = "staff_users"
++    __table_args__ = (
++        UniqueConstraint("username", name="uq_staff_users_username"),
++        CheckConstraint("role IN ('ADMIN', 'OPERADOR')", name="ck_staff_users_role"),
++        CheckConstraint(
++            "username ~ '^[a-z0-9._-]{3,50}$'",
++            name="ck_staff_users_username_format",
++        ),
++        CheckConstraint(
++            "failed_login_attempts >= 0",
++            name="ck_staff_users_failed_login_attempts",
++        ),
++        {
++            "comment": (
++                "Operadores do painel de estoque. "
++                "Senha guardada apenas como hash scrypt."
++            )
++        },
++    )
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    username: Mapped[str] = mapped_column(String(50), nullable=False)
++    full_name: Mapped[str] = mapped_column(String(120), nullable=False)
++    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
++    role: Mapped[str] = mapped_column(
++        String(20),
++        nullable=False,
++        default="OPERADOR",
++        server_default="OPERADOR",
++    )
++    active: Mapped[bool] = mapped_column(
++        Boolean,
++        nullable=False,
++        default=True,
++        server_default=text("true"),
++    )
++    failed_login_attempts: Mapped[int] = mapped_column(
++        Integer,
++        nullable=False,
++        default=0,
++        server_default=text("0"),
++    )
++    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
++    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        nullable=False,
++        server_default=func.now(),
++    )
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        nullable=False,
++        server_default=func.now(),
++    )
++
++
++class StaffSessionORM(Base):
++    """Sessão de login do painel; guarda apenas o SHA-256 do token do cookie."""
++
++    __tablename__ = "staff_sessions"
++    __table_args__ = (
++        UniqueConstraint("token_hash", name="uq_staff_sessions_token_hash"),
++        {
++            "comment": (
++                "Sessões do painel de estoque. "
++                "O token do cookie nunca é salvo, só o SHA-256."
++            )
++        },
++    )
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    staff_user_id: Mapped[int] = mapped_column(
++        BigInteger,
++        ForeignKey(
++            "staff_users.id",
++            ondelete="CASCADE",
++            name="fk_staff_sessions_staff_user_id",
++        ),
++        nullable=False,
++        index=True,
++    )
++    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        nullable=False,
++        server_default=func.now(),
++    )
++    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
++    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
++    user_agent: Mapped[str | None] = mapped_column(String(255))
++    ip_address: Mapped[str | None] = mapped_column(String(45))
++
++    staff_user: Mapped[StaffUserORM] = relationship()
++
++
++class StockMovementORM(Base):
++    """Livro-razão de estoque.
++
++    As linhas são escritas pelo trigger ``trg_products_stock_ledger`` sempre que
++    ``products.stock`` muda. A aplicação não insere aqui diretamente: ela define
++    o contexto com ``app.stock_service.set_stock_context`` e altera o estoque.
++    """
++
++    __tablename__ = "stock_movements"
++    __table_args__ = (
++        CheckConstraint(
++            "movement_type IN ('INITIAL_STOCK', 'RESTOCK', 'MANUAL_SALE', 'LOSS', "
++            "'ADJUSTMENT', 'MARKETPLACE_SALE', 'UNTRACKED')",
++            name="ck_stock_movements_type",
++        ),
++        CheckConstraint(
++            "source IN ('PAINEL', 'MARKETPLACE', 'BANCO')",
++            name="ck_stock_movements_source",
++        ),
++        CheckConstraint(
++            "quantity > 0 AND quantity = abs(delta)",
++            name="ck_stock_movements_quantity",
++        ),
++        CheckConstraint(
++            "stock_after = stock_before + delta",
++            name="ck_stock_movements_balance",
++        ),
++        Index(
++            "ix_stock_movements_product_id_created_at",
++            "product_id",
++            "created_at",
++        ),
++        {
++            "comment": (
++                "Livro-razão de estoque: uma linha por alteração de "
++                "products.stock. Preenchido pelo trigger trg_products_stock_ledger."
++            )
++        },
++    )
++
++    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
++    product_id: Mapped[str] = mapped_column(
++        String(50),
++        ForeignKey("products.id", name="fk_stock_movements_product_id"),
++        nullable=False,
++    )
++    product_name: Mapped[str] = mapped_column(String(120), nullable=False)
++    movement_type: Mapped[str] = mapped_column(String(30), nullable=False)
++    source: Mapped[str] = mapped_column(String(20), nullable=False)
++    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
++    delta: Mapped[int] = mapped_column(Integer, nullable=False)
++    stock_before: Mapped[int] = mapped_column(Integer, nullable=False)
++    stock_after: Mapped[int] = mapped_column(Integer, nullable=False)
++    reserved_stock_after: Mapped[int] = mapped_column(Integer, nullable=False)
++    order_id: Mapped[UUID | None] = mapped_column(
++        PostgreSQLUUID(as_uuid=True),
++        ForeignKey(
++            "orders.id",
++            ondelete="SET NULL",
++            name="fk_stock_movements_order_id",
++        ),
++        index=True,
++    )
++    staff_user_id: Mapped[int | None] = mapped_column(
++        BigInteger,
++        ForeignKey("staff_users.id", name="fk_stock_movements_staff_user_id"),
++        index=True,
++    )
++    buyer_name: Mapped[str | None] = mapped_column(String(80))
++    buyer_email: Mapped[str | None] = mapped_column(String(254))
++    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
++    note: Mapped[str | None] = mapped_column(String(500))
++    db_user: Mapped[str] = mapped_column(
++        String(63),
++        nullable=False,
++        server_default=text("SESSION_USER"),
++    )
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        nullable=False,
++        server_default=func.now(),
++        index=True,
++    )
++
++    staff_user: Mapped[StaffUserORM | None] = relationship()
+diff --git a/app/main.py b/app/main.py
+index 227ceb6..fd36ae1 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -34,6 +34,7 @@ from .payment_service import (
+     expire_due_payments,
+     process_mercadopago_payment,
+ )
++from .stock_panel import router as stock_panel_router
+ from .store import store
+ 
+ BASE_DIR = Path(__file__).resolve().parent
+@@ -82,6 +83,7 @@ async def lifespan(app: FastAPI):
+ 
+ app = FastAPI(title="Red Bull PDV — MVP", version="0.1.0", lifespan=lifespan)
+ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
++app.include_router(stock_panel_router)
+ 
+ 
+ @app.get("/", include_in_schema=False)
+diff --git a/app/models.py b/app/models.py
+index 3e2231c..6c38653 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -3,7 +3,7 @@ from enum import StrEnum
+ import re
+ from uuid import UUID
+ 
+-from pydantic import BaseModel, Field, field_validator
++from pydantic import BaseModel, Field, field_validator, model_validator
+ 
+ 
+ EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+@@ -144,3 +144,158 @@ class ManualReview(BaseModel):
+     details: str | None
+     created_at: datetime
+     resolved_at: datetime | None
++
++
++# ---------------------------------------------------------------------------
++# Controle de estoque (painel /estoque)
++# ---------------------------------------------------------------------------
++
++USERNAME_PATTERN = re.compile(r"^[a-z0-9._-]{3,50}$")
++# Caracteres de controle (inclusive NUL, que o PostgreSQL não aceita em texto).
++# Quebra de linha e tab são permitidas apenas na observação.
++CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
++LINE_BREAKS = re.compile(r"[\r\n\t]")
++
++
++class StaffRole(StrEnum):
++    ADMIN = "ADMIN"
++    OPERADOR = "OPERADOR"
++
++
++class StockMovementType(StrEnum):
++    INITIAL_STOCK = "INITIAL_STOCK"
++    RESTOCK = "RESTOCK"
++    MANUAL_SALE = "MANUAL_SALE"
++    LOSS = "LOSS"
++    ADJUSTMENT = "ADJUSTMENT"
++    MARKETPLACE_SALE = "MARKETPLACE_SALE"
++    UNTRACKED = "UNTRACKED"
++
++
++class StockMovementSource(StrEnum):
++    PAINEL = "PAINEL"
++    MARKETPLACE = "MARKETPLACE"
++    BANCO = "BANCO"
++
++
++# Tipos que um operador pode lançar pelo painel.
++PANEL_MOVEMENT_TYPES = {
++    StockMovementType.RESTOCK,
++    StockMovementType.MANUAL_SALE,
++    StockMovementType.LOSS,
++    StockMovementType.ADJUSTMENT,
++}
++
++
++def normalize_username(value: str) -> str:
++    normalized = value.strip().lower()
++    if not USERNAME_PATTERN.fullmatch(normalized):
++        raise ValueError(
++            "Usuário deve ter de 3 a 50 caracteres: letras minúsculas, números, '.', '_' ou '-'"
++        )
++    return normalized
++
++
++class StaffLogin(BaseModel):
++    username: str = Field(min_length=1, max_length=50)
++    password: str = Field(min_length=1, max_length=200)
++
++
++class StaffUser(BaseModel):
++    id: int
++    username: str
++    full_name: str
++    role: StaffRole
++
++
++class StockProduct(BaseModel):
++    id: str
++    name: str
++    category: str
++    stock: int
++    reserved_stock: int
++    available: int
++    out_today: int
++    last_movement_at: datetime | None = None
++
++
++class StockMovementCreate(BaseModel):
++    product_id: str = Field(min_length=1, max_length=50)
++    movement_type: StockMovementType
++    quantity: int | None = Field(default=None, ge=1, le=500)
++    counted_stock: int | None = Field(default=None, ge=0, le=10000)
++    buyer_name: str | None = Field(default=None, max_length=80)
++    buyer_email: str | None = Field(default=None, max_length=254)
++    note: str | None = Field(default=None, max_length=500)
++
++    @field_validator("buyer_name", "note")
++    @classmethod
++    def strip_optional_text(cls, value: str | None, info) -> str | None:
++        if value is None:
++            return None
++        if CONTROL_CHARS.search(value) or (
++            info.field_name == "buyer_name" and LINE_BREAKS.search(value)
++        ):
++            raise ValueError("Remova caracteres especiais/invisíveis do texto")
++        value = value.strip()
++        return value or None
++
++    @field_validator("buyer_email")
++    @classmethod
++    def validate_optional_email(cls, value: str | None) -> str | None:
++        if value is None or not value.strip():
++            return None
++        return normalize_payer_email(value)
++
++    @model_validator(mode="after")
++    def validate_by_type(self) -> "StockMovementCreate":
++        if self.movement_type not in PANEL_MOVEMENT_TYPES:
++            raise ValueError("Tipo de movimentação não pode ser lançado pelo painel")
++        if self.movement_type == StockMovementType.ADJUSTMENT:
++            if self.counted_stock is None:
++                raise ValueError("Informe a contagem física para o ajuste de inventário")
++            if not self.note:
++                raise ValueError("Explique o motivo do ajuste de inventário")
++        elif self.quantity is None:
++            raise ValueError("Informe a quantidade")
++        if self.movement_type == StockMovementType.MANUAL_SALE:
++            if not self.buyer_name or len(self.buyer_name) < 2:
++                raise ValueError("Informe o nome de quem comprou")
++        return self
++
++
++class StockMovement(BaseModel):
++    id: int
++    product_id: str
++    product_name: str
++    movement_type: StockMovementType
++    source: StockMovementSource
++    quantity: int
++    delta: int
++    stock_before: int
++    stock_after: int
++    order_id: UUID | None = None
++    buyer_name: str | None = None
++    buyer_email: str | None = None
++    unit_price: float | None = None
++    note: str | None = None
++    staff_username: str | None = None
++    staff_name: str | None = None
++    created_at: datetime
++
++
++class StockMovementResult(BaseModel):
++    movement: StockMovement
++    product: StockProduct
++
++
++class StockSummary(BaseModel):
++    day: str
++    units_out_today: int
++    units_in_today: int
++    marketplace_sales_today: int
++    manual_sales_today: int
++    losses_today: int
++    total_stock: int
++    total_reserved: int
++    total_available: int
+diff --git a/app/payment_service.py b/app/payment_service.py
+index cd7a73c..3b4283c 100644
+--- a/app/payment_service.py
++++ b/app/payment_service.py
+@@ -26,6 +26,8 @@ from .models import (
+     PaymentProvider as PaymentProviderName,
+     PaymentStatus,
+     ReservationStatus,
++    StockMovementSource,
++    StockMovementType,
+ )
+ from .payments import (
+     ChargeResult,
+@@ -33,6 +35,7 @@ from .payments import (
+     PaymentProviderError,
+     PaymentResult,
+ )
++from .stock_service import set_stock_context
+ from .store import store
+ 
+ 
+@@ -943,6 +946,13 @@ async def process_mercadopago_payment(
+         quantities = await _load_quantities(db, order_id)
+         product_ids = sorted(quantities)
+         products = await _lock_products(db, product_ids)
++        # Identifica a venda para o livro-razão de estoque (trigger no banco).
++        await set_stock_context(
++            db,
++            movement_type=StockMovementType.MARKETPLACE_SALE,
++            source=StockMovementSource.MARKETPLACE,
++            order_id=order_id,
++        )
+         outcome = "approved"
+         if late_after_release:
+             cancelled_by_buyer = payment.status == PaymentStatus.CANCELLED
+diff --git a/app/staff_auth.py b/app/staff_auth.py
+new file mode 100644
+index 0000000..aa054e4
+--- /dev/null
++++ b/app/staff_auth.py
+@@ -0,0 +1,370 @@
++"""Autenticação dos operadores do painel de estoque.
++
++- Senhas: ``hashlib.scrypt`` (biblioteca padrão), salt aleatório por usuário.
++- Sessões: token aleatório em cookie HttpOnly + SameSite=Strict; no banco fica
++  apenas o SHA-256 do token (``staff_sessions.token_hash``).
++- CSRF: rotas que alteram estado exigem o cabeçalho ``X-Requested-With``, que
++  um site de terceiros não consegue enviar sem CORS.
++- Força bruta: após ``STOCK_LOGIN_MAX_ATTEMPTS`` falhas, a conta fica
++  bloqueada por ``STOCK_LOGIN_LOCK_MINUTES``; além disso, cada IP tem um
++  limite de tentativas falhas (``STOCK_LOGIN_IP_MAX_FAILURES`` a cada 10 min).
++- O scrypt roda numa thread (``asyncio.to_thread``) para não travar o event
++  loop que também atende webhooks e a rotina de expiração.
++
++Nunca registre senhas, tokens ou hashes em log.
++"""
++
++import asyncio
++import base64
++import hashlib
++import hmac
++import os
++import secrets
++import time
++from collections import deque
++from dataclasses import dataclass
++from datetime import UTC, datetime, timedelta
++
++from fastapi import Depends, Header, HTTPException, Request, Response
++from sqlalchemy import select, update
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from .db.base import get_db
++from .db.models import StaffSessionORM, StaffUserORM
++from .models import StaffRole, StaffUser
++
++SESSION_COOKIE_NAME = "rb_estoque_session"
++CSRF_HEADER_VALUE = "estoque-panel"
++MIN_PASSWORD_LENGTH = 8
++
++_SCRYPT_N = 2**14
++_SCRYPT_R = 8
++_SCRYPT_P = 1
++_SCRYPT_DKLEN = 32
++# Hash de referência para gastar o mesmo tempo quando o usuário não existe.
++_DUMMY_HASH: str | None = None
++
++
++def _env_int(name: str, default: int) -> int:
++    raw = os.getenv(name, "").strip()
++    if not raw:
++        return default
++    try:
++        value = int(raw)
++    except ValueError as exc:
++        raise RuntimeError(f"{name} deve ser um número inteiro") from exc
++    if value <= 0:
++        raise RuntimeError(f"{name} deve ser maior que zero")
++    return value
++
++
++def session_ttl() -> timedelta:
++    return timedelta(hours=_env_int("STOCK_SESSION_TTL_HOURS", 12))
++
++
++def cookie_secure() -> bool:
++    return os.getenv("STOCK_SESSION_COOKIE_SECURE", "true").strip().lower() not in {
++        "0",
++        "false",
++        "no",
++        "nao",
++        "não",
++    }
++
++
++def max_login_attempts() -> int:
++    return _env_int("STOCK_LOGIN_MAX_ATTEMPTS", 5)
++
++
++def login_lock_duration() -> timedelta:
++    return timedelta(minutes=_env_int("STOCK_LOGIN_LOCK_MINUTES", 15))
++
++
++def ip_max_failures() -> int:
++    return _env_int("STOCK_LOGIN_IP_MAX_FAILURES", 20)
++
++
++IP_WINDOW_SECONDS = 600
++_MAX_TRACKED_IPS = 5000
++
++
++class LoginThrottle:
++    """Limite de falhas de login por IP, em memória (uma instância por processo)."""
++
++    def __init__(self) -> None:
++        self._failures: dict[str, deque[float]] = {}
++
++    def _recent(self, ip: str, now: float) -> deque[float]:
++        attempts = self._failures.get(ip)
++        if attempts is None:
++            return deque()
++        while attempts and now - attempts[0] > IP_WINDOW_SECONDS:
++            attempts.popleft()
++        if not attempts:
++            self._failures.pop(ip, None)
++        return attempts
++
++    def is_blocked(self, ip: str) -> bool:
++        return len(self._recent(ip, time.monotonic())) >= ip_max_failures()
++
++    def record_failure(self, ip: str) -> None:
++        now = time.monotonic()
++        if len(self._failures) >= _MAX_TRACKED_IPS and ip not in self._failures:
++            # Evita crescimento ilimitado: descarta o IP mais antigo.
++            self._failures.pop(next(iter(self._failures)))
++        attempts = self._failures.setdefault(ip, deque())
++        attempts.append(now)
++
++    def reset(self, ip: str) -> None:
++        self._failures.pop(ip, None)
++
++    def clear(self) -> None:
++        self._failures.clear()
++
++
++login_throttle = LoginThrottle()
++
++
++def _b64(data: bytes) -> str:
++    return base64.b64encode(data).decode("ascii")
++
++
++def hash_password(password: str) -> str:
++    if len(password) < MIN_PASSWORD_LENGTH:
++        raise ValueError(f"A senha precisa ter pelo menos {MIN_PASSWORD_LENGTH} caracteres")
++    salt = secrets.token_bytes(16)
++    digest = hashlib.scrypt(
++        password.encode("utf-8"),
++        salt=salt,
++        n=_SCRYPT_N,
++        r=_SCRYPT_R,
++        p=_SCRYPT_P,
++        dklen=_SCRYPT_DKLEN,
++    )
++    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${_b64(salt)}${_b64(digest)}"
++
++
++def verify_password(password: str, stored_hash: str) -> bool:
++    try:
++        algorithm, n, r, p, salt_b64, digest_b64 = stored_hash.split("$")
++        if algorithm != "scrypt":
++            return False
++        salt = base64.b64decode(salt_b64)
++        expected = base64.b64decode(digest_b64)
++        candidate = hashlib.scrypt(
++            password.encode("utf-8"),
++            salt=salt,
++            n=int(n),
++            r=int(r),
++            p=int(p),
++            dklen=len(expected),
++        )
++    except (ValueError, TypeError):
++        return False
++    return hmac.compare_digest(candidate, expected)
++
++
++def _dummy_hash() -> str:
++    global _DUMMY_HASH
++    if _DUMMY_HASH is None:
++        _DUMMY_HASH = hash_password(secrets.token_urlsafe(16))
++    return _DUMMY_HASH
++
++
++def hash_session_token(token: str) -> str:
++    return hashlib.sha256(token.encode("utf-8", "surrogatepass")).hexdigest()
++
++
++@dataclass(frozen=True)
++class StaffPrincipal:
++    id: int
++    username: str
++    full_name: str
++    role: StaffRole
++    session_id: int
++
++    def to_model(self) -> StaffUser:
++        return StaffUser(
++            id=self.id,
++            username=self.username,
++            full_name=self.full_name,
++            role=self.role,
++        )
++
++
++def require_panel_header(
++    x_requested_with: str | None = Header(None),
++) -> None:
++    """Defesa simples contra CSRF para rotas que alteram estado."""
++    if x_requested_with != CSRF_HEADER_VALUE:
++        raise HTTPException(403, "Requisição recusada")
++
++
++async def authenticate(
++    db: AsyncSession,
++    username: str,
++    password: str,
++    *,
++    user_agent: str | None,
++    ip_address: str | None,
++) -> tuple[StaffUser, str]:
++    """Valida usuário e senha e abre uma sessão. Retorna o token em claro.
++
++    A verificação da senha acontece fora de qualquer transação/lock e numa
++    thread separada; só depois a linha do usuário é travada (FOR NO KEY
++    UPDATE, que não bloqueia inserts no livro-razão que referenciam o usuário).
++    """
++    username = username.strip().lower()
++    ip_key = ip_address or "desconhecido"
++    invalid = HTTPException(401, "Usuário ou senha inválidos")
++    too_many = HTTPException(
++        429,
++        "Muitas tentativas de login. Aguarde alguns minutos e tente novamente.",
++    )
++    if login_throttle.is_blocked(ip_key):
++        raise too_many
++
++    async with db.begin():
++        snapshot = (
++            await db.execute(
++                select(
++                    StaffUserORM.id,
++                    StaffUserORM.password_hash,
++                    StaffUserORM.locked_until,
++                ).where(StaffUserORM.username == username)
++            )
++        ).one_or_none()
++
++    now = datetime.now(UTC)
++    if snapshot is not None and snapshot.locked_until and snapshot.locked_until > now:
++        login_throttle.record_failure(ip_key)
++        raise too_many
++    stored_hash = snapshot.password_hash if snapshot is not None else _dummy_hash()
++    password_ok = await asyncio.to_thread(verify_password, password, stored_hash)
++    if snapshot is None:
++        login_throttle.record_failure(ip_key)
++        raise invalid
++
++    now = datetime.now(UTC)
++    async with db.begin():
++        user = (
++            await db.execute(
++                select(StaffUserORM)
++                .where(StaffUserORM.id == snapshot.id)
++                .with_for_update(key_share=True)
++            )
++        ).scalar_one_or_none()
++        # A senha verificada precisa ser a mesma que está no banco agora.
++        password_ok = (
++            password_ok
++            and user is not None
++            and hmac.compare_digest(user.password_hash, snapshot.password_hash)
++        )
++        if user is None or not user.active or not password_ok:
++            if user is not None and user.active and not password_ok:
++                attempts = user.failed_login_attempts + 1
++                user.failed_login_attempts = attempts
++                if attempts >= max_login_attempts():
++                    user.failed_login_attempts = 0
++                    user.locked_until = now + login_lock_duration()
++                user.updated_at = now
++            # O commit acontece mesmo com a falha (contador de tentativas).
++            failure = invalid
++        else:
++            failure = None
++            user.failed_login_attempts = 0
++            user.locked_until = None
++            user.last_login_at = now
++            user.updated_at = now
++            token = secrets.token_urlsafe(32)
++            db.add(
++                StaffSessionORM(
++                    staff_user_id=user.id,
++                    token_hash=hash_session_token(token),
++                    created_at=now,
++                    expires_at=now + session_ttl(),
++                    user_agent=(user_agent or "")[:255] or None,
++                    ip_address=(ip_address or "")[:45] or None,
++                )
++            )
++            staff = StaffUser(
++                id=user.id,
++                username=user.username,
++                full_name=user.full_name,
++                role=StaffRole(user.role),
++            )
++
++    if failure is not None:
++        login_throttle.record_failure(ip_key)
++        raise failure
++    login_throttle.reset(ip_key)
++    return staff, token
++
++
++def set_session_cookie(response: Response, token: str) -> None:
++    response.set_cookie(
++        SESSION_COOKIE_NAME,
++        token,
++        max_age=int(session_ttl().total_seconds()),
++        httponly=True,
++        secure=cookie_secure(),
++        samesite="strict",
++        path="/",
++    )
++
++
++def clear_session_cookie(response: Response) -> None:
++    response.delete_cookie(
++        SESSION_COOKIE_NAME,
++        httponly=True,
++        secure=cookie_secure(),
++        samesite="strict",
++        path="/",
++    )
++
++
++async def revoke_session(db: AsyncSession, token: str | None) -> None:
++    if not token:
++        return
++    async with db.begin():
++        await db.execute(
++            update(StaffSessionORM)
++            .where(
++                StaffSessionORM.token_hash == hash_session_token(token),
++                StaffSessionORM.revoked_at.is_(None),
++            )
++            .values(revoked_at=datetime.now(UTC))
++        )
++
++
++async def require_staff(
++    request: Request,
++    db: AsyncSession = Depends(get_db),
++) -> StaffPrincipal:
++    token = request.cookies.get(SESSION_COOKIE_NAME)
++    if not token:
++        raise HTTPException(401, "Faça login para acessar o controle de estoque")
++    now = datetime.now(UTC)
++    async with db.begin():
++        row = (
++            await db.execute(
++                select(StaffSessionORM.id, StaffUserORM)
++                .join(StaffUserORM, StaffUserORM.id == StaffSessionORM.staff_user_id)
++                .where(
++                    StaffSessionORM.token_hash == hash_session_token(token),
++                    StaffSessionORM.revoked_at.is_(None),
++                    StaffSessionORM.expires_at > now,
++                    StaffUserORM.active.is_(True),
++                )
++            )
++        ).one_or_none()
++    if row is None:
++        raise HTTPException(401, "Sessão expirada. Faça login novamente.")
++    session_id, user = row
++    return StaffPrincipal(
++        id=user.id,
++        username=user.username,
++        full_name=user.full_name,
++        role=StaffRole(user.role),
++        session_id=session_id,
++    )
+diff --git a/app/static/estoque/estoque.css b/app/static/estoque/estoque.css
+new file mode 100644
+index 0000000..d8d7a92
+--- /dev/null
++++ b/app/static/estoque/estoque.css
+@@ -0,0 +1,264 @@
++:root {
++  --bg: #070d16;
++  --surface: #101a26;
++  --surface-2: #131f2d;
++  --surface-soft: #0c1520;
++  --green: #32e968;
++  --green-pressed: #27cc59;
++  --green-soft: rgba(50, 233, 104, .12);
++  --red: #ff5c5c;
++  --red-soft: rgba(255, 92, 92, .12);
++  --amber: #ffc845;
++  --amber-soft: rgba(255, 200, 69, .12);
++  --blue: #6aa8ff;
++  --blue-soft: rgba(106, 168, 255, .12);
++  --text: #ffffff;
++  --muted: #b6bdc8;
++  --faint: #7d8898;
++  --border: #344152;
++  --border-soft: #233041;
++  --disabled: #526070;
++  --radius: 18px;
++  --shadow: 0 18px 50px rgba(0, 0, 0, .28);
++}
++
++* { box-sizing: border-box; }
++html { min-width: 320px; background: var(--bg); }
++body {
++  margin: 0;
++  min-height: 100vh;
++  background: radial-gradient(circle at 50% -15%, rgba(50, 233, 104, .07), transparent 38rem), var(--bg);
++  color: var(--text);
++  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
++  -webkit-font-smoothing: antialiased;
++}
++button, input, textarea { font: inherit; color: inherit; }
++button { -webkit-tap-highlight-color: transparent; cursor: pointer; }
++svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
++.hidden { display: none !important; }
++.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
++.muted { color: var(--muted); }
++.small { font-size: 12px; }
++.eyebrow { margin: 0 0 6px; color: var(--green); font-size: 11px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
++h1 span, h2 span { color: var(--green); }
++:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
++
++/* Botões ------------------------------------------------------------------ */
++.primary-button {
++  position: relative; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
++  min-height: 50px; padding: 0 22px; border: 0; border-radius: 14px;
++  background: var(--green); color: #04110a; font-weight: 800;
++  transition: background .2s, transform .1s;
++}
++.primary-button:hover:not(:disabled) { background: var(--green-pressed); }
++.primary-button:active:not(:disabled) { transform: scale(.98); }
++.primary-button:disabled { background: var(--disabled); color: #c7ced8; cursor: not-allowed; }
++.primary-button.danger { background: var(--red); color: #1a0505; }
++.primary-button.danger:hover:not(:disabled) { background: #f04848; }
++.button-loader { display: none; width: 18px; height: 18px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
++.loading .button-loader { display: inline-block; }
++.loading .button-label { opacity: .6; }
++@keyframes spin { to { transform: rotate(360deg); } }
++
++.ghost-button {
++  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
++  min-height: 42px; padding: 0 16px; border: 1px solid var(--border); border-radius: 12px;
++  background: transparent; color: var(--text); font-weight: 600; font-size: 14px;
++  transition: border-color .2s, background .2s;
++}
++.ghost-button svg { width: 18px; height: 18px; }
++.ghost-button:hover { border-color: #526174; background: rgba(255, 255, 255, .03); }
++.ghost-button.wide { width: 100%; margin-top: 10px; }
++.icon-button { display: grid; place-items: center; width: 40px; height: 40px; border: 1px solid var(--border); border-radius: 12px; background: transparent; }
++.icon-button svg { width: 20px; height: 20px; }
++
++/* Inputs ------------------------------------------------------------------ */
++.input-wrap { position: relative; margin-bottom: 14px; }
++.input-wrap svg { position: absolute; top: 15px; left: 15px; width: 20px; color: var(--muted); }
++.input-wrap input { padding-left: 46px !important; }
++input, textarea {
++  width: 100%; min-height: 50px; padding: 0 14px;
++  border: 1px solid var(--border); border-radius: 14px; outline: 0;
++  background: var(--surface-soft); transition: border-color .2s, box-shadow .2s;
++}
++textarea { min-height: 64px; padding: 12px 14px; resize: vertical; }
++input::placeholder, textarea::placeholder { color: #778393; }
++input:focus, textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
++input[aria-invalid="true"], textarea[aria-invalid="true"] { border-color: var(--red); box-shadow: 0 0 0 3px var(--red-soft); }
++label { display: inline-block; margin: 0 0 8px 2px; font-size: 14px; font-weight: 700; }
++.required { color: var(--red); }
++.optional { color: var(--faint); font-weight: 500; }
++.form-error { min-height: 18px; margin: 4px 2px 12px; color: var(--red); font-size: 13px; }
++
++/* Login ------------------------------------------------------------------- */
++.login-shell { display: grid; place-items: center; min-height: 100vh; padding: 24px 16px; }
++.login-card {
++  width: min(100%, 400px); padding: 30px 26px 26px;
++  border: 1px solid var(--border); border-radius: 24px;
++  background: linear-gradient(160deg, var(--surface), #0d1723); box-shadow: var(--shadow);
++  animation: rise .35s ease both;
++}
++.login-logo { display: block; width: 92px; height: 56px; margin: 0 0 22px; object-fit: contain; }
++.login-card h1 { margin: 0; font-size: 34px; line-height: 1.04; letter-spacing: -.04em; }
++.login-card > p.muted { margin: 12px 0 24px; font-size: 14px; line-height: 1.55; }
++.login-card .primary-button { width: 100%; }
++@keyframes rise { from { opacity: 0; transform: translateY(8px); } }
++
++/* Painel ------------------------------------------------------------------ */
++.panel-shell { width: min(100%, 1240px); margin: 0 auto; padding: 0 20px 40px; animation: rise .35s ease both; }
++.topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 0 18px; }
++.topbar-brand { display: flex; align-items: center; gap: 16px; min-width: 0; }
++.topbar-brand img { width: 74px; height: 46px; object-fit: contain; }
++.topbar-brand h1 { margin: 0; font-size: clamp(22px, 3.2vw, 30px); letter-spacing: -.035em; line-height: 1.05; }
++.topbar-user { display: flex; align-items: center; gap: 10px; }
++.user-chip { display: grid; padding: 6px 12px; border: 1px solid var(--border-soft); border-radius: 12px; background: var(--surface-soft); text-align: right; }
++.user-chip b { font-size: 13px; }
++.user-chip small { color: var(--faint); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
++
++.kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 22px; }
++.kpi { display: grid; gap: 4px; padding: 16px 18px; border: 1px solid var(--border-soft); border-radius: var(--radius); background: linear-gradient(140deg, var(--surface), #0e1824); }
++.kpi small { color: var(--muted); font-size: 12px; font-weight: 600; }
++.kpi b { font-size: 30px; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
++.kpi span { color: var(--faint); font-size: 12px; }
++.kpi-out b { color: var(--green); }
++
++.panel-grid { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 22px; align-items: start; }
++.section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
++.section-head h2 { margin: 0; font-size: 18px; letter-spacing: -.02em; }
++.filters { display: flex; gap: 6px; flex-wrap: wrap; }
++.chip { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 999px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 600; }
++.chip.active { border-color: var(--green); background: var(--green-soft); color: var(--green); }
++.search-wrap { position: relative; margin-bottom: 14px; }
++.search-wrap svg { position: absolute; top: 14px; left: 14px; width: 20px; color: var(--muted); }
++.search-wrap input { min-height: 46px; padding-left: 44px; }
++
++/* Cards de sabor ------------------------------------------------------------- */
++.product-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 12px; }
++.card {
++  position: relative; display: grid; grid-template-rows: auto 1fr auto; gap: 12px;
++  padding: 16px; border: 1px solid var(--border); border-radius: 20px;
++  background: linear-gradient(130deg, var(--surface), #111e2c); box-shadow: 0 8px 28px rgba(0, 0, 0, .14);
++  transition: border-color .25s, transform .2s;
++}
++.card.flash-in { animation: flash-in 1.2s ease; }
++.card.flash-out { animation: flash-out 1.2s ease; }
++@keyframes flash-in { 0% { border-color: var(--green); box-shadow: 0 0 0 4px var(--green-soft); } 100% {} }
++@keyframes flash-out { 0% { border-color: var(--amber); box-shadow: 0 0 0 4px var(--amber-soft); } 100% {} }
++.card.skeleton { min-height: 236px; background: linear-gradient(90deg, var(--surface) 25%, #182635 50%, var(--surface) 75%); background-size: 200% 100%; animation: skeleton 1.4s infinite; }
++@keyframes skeleton { to { background-position: -200% 0; } }
++.card-top { display: grid; grid-template-columns: 62px minmax(0, 1fr); gap: 12px; align-items: center; }
++.card-image { position: relative; width: 62px; height: 78px; }
++.card-image img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(6px 7px 6px rgba(0, 0, 0, .38)); }
++.card-title { min-width: 0; }
++.card-title h3 { margin: 0; font-size: 16px; line-height: 1.2; overflow-wrap: anywhere; }
++.badge { display: inline-flex; align-items: center; gap: 4px; margin-top: 6px; padding: 2px 8px; border-radius: 999px; background: rgba(255, 255, 255, .06); color: var(--muted); font-size: 11px; font-weight: 600; }
++.badge.low { background: var(--amber-soft); color: var(--amber); }
++.badge.empty { background: var(--red-soft); color: var(--red); }
++
++.card-stock { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; }
++.stock-number { display: grid; }
++.stock-number b { font-size: 40px; line-height: 1; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
++.stock-number small { margin-top: 4px; color: var(--muted); font-size: 12px; }
++.stock-meta { display: grid; gap: 3px; color: var(--faint); font-size: 12px; text-align: right; }
++.stock-meta strong { color: var(--muted); font-weight: 600; }
++
++.card-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
++.card-actions button {
++  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
++  min-height: 46px; border-radius: 14px; font-weight: 800; font-size: 15px;
++  transition: background .2s, transform .1s;
++}
++.card-actions button:active:not(:disabled) { transform: scale(.97); }
++.card-actions .btn-out { border: 1px solid rgba(255, 92, 92, .55); background: var(--red-soft); color: #ff8a8a; }
++.card-actions .btn-out:hover:not(:disabled) { background: rgba(255, 92, 92, .2); }
++.card-actions .btn-in { border: 1px solid rgba(50, 233, 104, .6); background: var(--green-soft); color: var(--green); }
++.card-actions .btn-in:hover:not(:disabled) { background: rgba(50, 233, 104, .2); }
++.card-actions button:disabled { border-color: var(--border-soft); background: transparent; color: var(--disabled); cursor: not-allowed; }
++.card-actions .sign { font-size: 22px; line-height: 1; }
++.adjust-link { justify-self: start; padding: 0; border: 0; background: none; color: var(--faint); font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
++.adjust-link:hover { color: var(--muted); }
++.empty-state { grid-column: 1 / -1; padding: 28px; border: 1px dashed var(--border); border-radius: 18px; color: var(--muted); text-align: center; }
++
++/* Histórico ------------------------------------------------------------------ */
++.history { position: sticky; top: 16px; padding: 18px; border: 1px solid var(--border-soft); border-radius: 22px; background: var(--surface-soft); }
++.history-list { display: grid; gap: 2px; max-height: calc(100vh - 220px); margin: 0; padding: 0; overflow-y: auto; list-style: none; }
++.history-item { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: start; padding: 11px 4px; border-bottom: 1px solid var(--border-soft); }
++.history-item:last-child { border-bottom: 0; }
++.history-delta { min-width: 44px; padding: 4px 0; border-radius: 10px; font-weight: 800; font-size: 14px; text-align: center; font-variant-numeric: tabular-nums; }
++.history-delta.out { background: var(--red-soft); color: #ff8a8a; }
++.history-delta.in { background: var(--green-soft); color: var(--green); }
++.history-body { min-width: 0; }
++.history-body > b { display: block; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.history-body span b { color: var(--text); font-weight: 700; }
++.history-body span { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
++.history-body .type { display: inline-block; margin-right: 4px; padding: 1px 6px; border-radius: 6px; background: rgba(255, 255, 255, .06); color: var(--muted); font-size: 11px; font-weight: 700; }
++.history-body .type.MARKETPLACE_SALE { background: var(--blue-soft); color: var(--blue); }
++.history-body .type.UNTRACKED { background: var(--amber-soft); color: var(--amber); }
++.history-time { color: var(--faint); font-size: 11px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
++.history-empty { padding: 20px 4px; color: var(--muted); font-size: 13px; }
++
++/* Diálogo -------------------------------------------------------------------- */
++dialog {
++  width: min(100% - 24px, 460px); max-height: calc(100vh - 24px); padding: 0;
++  border: 1px solid var(--border); border-radius: 24px;
++  background: linear-gradient(160deg, var(--surface), #0d1723); color: var(--text); box-shadow: var(--shadow);
++}
++dialog::backdrop { background: rgba(3, 7, 12, .72); backdrop-filter: blur(3px); }
++dialog[open] { animation: rise .2s ease both; }
++#movement-form { display: grid; padding: 20px 20px 18px; overflow-y: auto; }
++.dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
++.dialog-product { display: flex; gap: 12px; align-items: center; min-width: 0; }
++.dialog-product img { width: 46px; height: 60px; object-fit: contain; filter: drop-shadow(5px 6px 5px rgba(0, 0, 0, .35)); }
++.dialog-product h2 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
++.dialog-product p.muted { margin: 4px 0 0; }
++.type-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin: 0 0 16px; padding: 0; border: 0; }
++.type-option { position: relative; }
++.type-option input { position: absolute; opacity: 0; pointer-events: none; }
++.type-option label { display: grid; gap: 2px; width: 100%; margin: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-soft); cursor: pointer; transition: border-color .2s, background .2s; }
++.type-option label small { color: var(--faint); font-size: 11px; font-weight: 500; }
++.type-option input:checked + label { border-color: var(--green); background: var(--green-soft); }
++.type-option input:focus-visible + label { outline: 2px solid var(--green); outline-offset: 2px; }
++.field { margin-bottom: 12px; }
++.stepper { display: grid; grid-template-columns: 50px 1fr 50px; height: 52px; border: 1px solid var(--green); border-radius: 14px; overflow: hidden; }
++.stepper button { border: 0; background: transparent; color: var(--green); font-size: 26px; line-height: 1; }
++.stepper button:hover { background: var(--green-soft); }
++.stepper input { min-height: 0; height: 100%; border: 0; border-radius: 0; background: transparent; font-size: 20px; font-weight: 800; text-align: center; -moz-appearance: textfield; }
++.stepper input:focus { box-shadow: none; }
++.stepper input::-webkit-outer-spin-button, .stepper input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
++.preview { min-height: 20px; margin: 4px 2px 6px; color: var(--muted); font-size: 13px; }
++.preview b { color: var(--text); }
++.dialog-actions { display: grid; grid-template-columns: 1fr 1.4fr; gap: 10px; margin-top: 6px; }
++.dialog-actions .ghost-button { min-height: 50px; }
++
++/* Toast -------------------------------------------------------------------- */
++.toast {
++  position: fixed; left: 50%; bottom: calc(22px + env(safe-area-inset-bottom)); z-index: 30;
++  max-width: min(92vw, 460px); padding: 13px 18px; border: 1px solid var(--border); border-radius: 14px;
++  background: #0f1b28; box-shadow: var(--shadow); color: var(--text); font-size: 14px;
++  opacity: 0; pointer-events: none; transform: translate(-50%, 12px); transition: opacity .25s, transform .25s;
++}
++.toast.show { opacity: 1; transform: translate(-50%, 0); }
++.toast.error { border-color: rgba(255, 92, 92, .6); }
++
++/* Responsivo ----------------------------------------------------------------- */
++@media (max-width: 1020px) {
++  .panel-grid { grid-template-columns: 1fr; }
++  .history { position: static; }
++  .history-list { max-height: none; }
++}
++@media (max-width: 720px) {
++  .panel-shell { padding: 0 16px 32px; }
++  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
++  .kpi { padding: 14px; }
++  .kpi b { font-size: 26px; }
++  .topbar { padding: 16px 0 14px; }
++  .topbar-brand { gap: 10px; }
++  .topbar-brand img { width: 52px; height: 34px; }
++  .topbar-brand .eyebrow { display: none; }
++  .user-chip, .logout-label { display: none; }
++  #logout { width: 42px; padding: 0; }
++  .product-grid { grid-template-columns: 1fr; }
++}
++@media (prefers-reduced-motion: reduce) {
++  *, *::before, *::after { animation: none !important; transition: none !important; }
++}
+diff --git a/app/static/estoque/estoque.js b/app/static/estoque/estoque.js
+new file mode 100644
+index 0000000..a4e7f0e
+--- /dev/null
++++ b/app/static/estoque/estoque.js
+@@ -0,0 +1,642 @@
++'use strict';
++
++const API = '/api/estoque';
++const CSRF_HEADER = { 'X-Requested-With': 'estoque-panel' };
++const REFRESH_MS = 30000;
++const LOW_STOCK = 5;
++const TIMEZONE = 'America/Recife';
++
++const TYPE_LABELS = {
++  INITIAL_STOCK: 'Estoque inicial',
++  RESTOCK: 'Reposição',
++  MANUAL_SALE: 'Venda manual',
++  LOSS: 'Perda/avaria',
++  ADJUSTMENT: 'Ajuste',
++  MARKETPLACE_SALE: 'Marketplace',
++  UNTRACKED: 'Sem contexto'
++};
++
++const MODES = {
++  out: {
++    eyebrow: 'Saída de estoque',
++    submit: 'Registrar saída',
++    danger: true,
++    types: [
++      { value: 'MANUAL_SALE', title: 'Venda', hint: 'alguém levou e pagou' },
++      { value: 'LOSS', title: 'Perda', hint: 'avaria, vencida, sumiu' }
++    ]
++  },
++  in: {
++    eyebrow: 'Entrada de estoque',
++    submit: 'Registrar entrada',
++    danger: false,
++    types: [{ value: 'RESTOCK', title: 'Reposição', hint: 'latas chegaram' }]
++  },
++  adjust: {
++    eyebrow: 'Ajuste de inventário',
++    submit: 'Salvar contagem',
++    danger: false,
++    types: [{ value: 'ADJUSTMENT', title: 'Contagem física', hint: 'corrige o estoque' }]
++  }
++};
++
++const state = {
++  user: null,
++  products: [],
++  category: '',
++  search: '',
++  history: [],
++  historyDirection: '',
++  historyHasMore: false,
++  dialog: null,
++  submitting: false,
++  refreshTimer: null
++};
++
++const el = id => document.getElementById(id);
++const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
++const money = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
++const units = n => `${n} ${Math.abs(n) === 1 ? 'lata' : 'latas'}`;
++const timeFormat = new Intl.DateTimeFormat('pt-BR', { timeZone: TIMEZONE, hour: '2-digit', minute: '2-digit' });
++const dayFormat = new Intl.DateTimeFormat('pt-BR', { timeZone: TIMEZONE, day: '2-digit', month: '2-digit' });
++const dayKey = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE });
++
++function formatWhen(iso) {
++  const date = new Date(iso);
++  const sameDay = dayKey.format(date) === dayKey.format(new Date());
++  return sameDay ? timeFormat.format(date) : `${dayFormat.format(date)} ${timeFormat.format(date)}`;
++}
++
++/* ---------------------------------------------------------------- API ---- */
++
++class ApiError extends Error {
++  constructor(message, status) {
++    super(message);
++    this.status = status;
++  }
++}
++
++function errorMessage(data) {
++  if (!data || data.detail == null) return 'Não foi possível concluir a operação. Tente novamente.';
++  if (Array.isArray(data.detail)) {
++    return data.detail.map(item => String(item.msg || '').replace(/^Value error, /, '')).filter(Boolean).join(' ') || 'Dados inválidos.';
++  }
++  return String(data.detail);
++}
++
++async function api(path, options = {}) {
++  const method = options.method || 'GET';
++  const headers = { Accept: 'application/json', ...(method === 'GET' ? {} : { 'Content-Type': 'application/json', ...CSRF_HEADER }) };
++  let response;
++  try {
++    response = await fetch(`${API}${path}`, { credentials: 'same-origin', ...options, method, headers });
++  } catch {
++    throw new ApiError('Sem conexão com o servidor. Verifique a rede.', 0);
++  }
++  if (response.status === 204) return null;
++  const data = await response.json().catch(() => null);
++  if (!response.ok) {
++    if (response.status === 401 && path !== '/login' && path !== '/me') showLogin('Sua sessão expirou. Entre novamente.');
++    throw new ApiError(errorMessage(data), response.status);
++  }
++  return data;
++}
++
++/* -------------------------------------------------------------- Toast ---- */
++
++let toastTimer;
++function toast(message, isError = false) {
++  const node = el('toast');
++  clearTimeout(toastTimer);
++  node.textContent = message;
++  node.classList.toggle('error', isError);
++  node.classList.add('show');
++  toastTimer = setTimeout(() => node.classList.remove('show'), 3800);
++}
++
++/* ------------------------------------------------------------ Imagens ---- */
++// Mesmo mapeamento do PDV (app/static/app.js) para os sabores aparecerem iguais.
++
++function normalizeId(value) {
++  return String(value || '')
++    .toLowerCase()
++    .normalize('NFD')
++    .replace(/\p{Diacritic}/gu, '')
++    .replace(/[^a-z0-9]+/g, '_')
++    .replace(/^_+|_+$/g, '');
++}
++
++function productImage(product) {
++  const images = {
++    tropical: '/static/assets/red-bull-tropical-transparent.png?v=20260802-2',
++    melancia: '/static/assets/red-bull-melancia-transparent.png?v=20260802-2',
++    original: '/static/assets/red-bull-original-transparent.png?v=20260802-2',
++    zero_tradicional: '/static/assets/redbull_tradicional_zero.png?v=20260806-2',
++    redbull_tradicional_zero: '/static/assets/redbull_tradicional_zero.png?v=20260806-2',
++    redbull_zero: '/static/assets/redbull_tradicional_zero.png?v=20260806-2',
++    nectarina: '/static/assets/nectarina.png?v=20260806-2',
++    nectarina_sugarfree: '/static/assets/nectarina_sugarfree-removebg.png?v=20260806-2',
++    pomelo_sugarfree: '/static/assets/pomelo_sugarfree-removebg-preview.png?v=20260806-2',
++    amora_sugarfree: '/static/assets/amora_sugarfree.png?v=20260806-2',
++    maca_sugarfree: '/static/assets/maça_sugarfree.png?v=20260806-2',
++    melao_e_maracuja: '/static/assets/Melão_e_maracuja.webp?v=20260806-2',
++    morango_e_pessego: '/static/assets/morango_e_pessego.webp?v=20260806-2',
++    sugarfree: '/static/assets/sugarfree-removebg.png?v=20260806-2',
++    tradicional_sugarfree: '/static/assets/sugarfree-removebg.png?v=20260806-2'
++  };
++
++  const id = normalizeId(product.id);
++  if (images[id]) return images[id];
++
++  const name = normalizeId(product.name);
++  if (name.includes('zero') || name.includes('tradicional')) return images.zero_tradicional;
++  if (name.includes('nectarina') && name.includes('sugarfree')) return images.nectarina_sugarfree;
++  if (name.includes('nectarina')) return images.nectarina;
++  if (name.includes('pomelo')) return images.pomelo_sugarfree;
++  if (name.includes('amora')) return images.amora_sugarfree;
++  if (name.includes('maca')) return images.maca_sugarfree;
++  if (name.includes('morango') || name.includes('pessego')) return images.morango_e_pessego;
++  if (name.includes('melao') || name.includes('maracuja')) return images.melao_e_maracuja;
++  if (name.includes('sugarfree')) return images.sugarfree;
++  return images.original;
++}
++
++/* ------------------------------------------------------------ Login ------ */
++
++function showLogin(message = '') {
++  stopRefresh();
++  state.user = null;
++  if (el('movement-dialog').open) el('movement-dialog').close();
++  el('panel-view').classList.add('hidden');
++  el('login-view').classList.remove('hidden');
++  el('login-error').textContent = message;
++  el('login-password').value = '';
++  setTimeout(() => (el('login-username').value ? el('login-password') : el('login-username')).focus(), 50);
++}
++
++function showPanel(user) {
++  state.user = user;
++  el('login-view').classList.add('hidden');
++  el('panel-view').classList.remove('hidden');
++  el('user-name').textContent = user.full_name;
++  el('user-role').textContent = user.role === 'ADMIN' ? 'Administrador' : 'Operador';
++  refreshAll();
++  startRefresh();
++}
++
++async function onLogin(event) {
++  event.preventDefault();
++  const username = el('login-username').value.trim().toLowerCase();
++  const password = el('login-password').value;
++  if (!username || !password) {
++    el('login-error').textContent = 'Informe usuário e senha.';
++    return;
++  }
++  const button = el('login-submit');
++  button.disabled = true;
++  button.classList.add('loading');
++  el('login-error').textContent = '';
++  try {
++    const user = await api('/login', { method: 'POST', body: JSON.stringify({ username, password }) });
++    el('login-password').value = '';
++    showPanel(user);
++  } catch (error) {
++    el('login-error').textContent = error.message;
++    el('login-password').select();
++  } finally {
++    button.disabled = false;
++    button.classList.remove('loading');
++  }
++}
++
++async function onLogout() {
++  try {
++    await api('/logout', { method: 'POST' });
++  } catch {
++    // Mesmo que a rede falhe, a tela volta para o login.
++  }
++  showLogin('Você saiu do painel.');
++}
++
++/* ------------------------------------------------------------ Dados ------ */
++
++async function refreshAll({ automatic = false } = {}) {
++  const tasks = [loadProducts(), loadSummary()];
++  // No refresh automático, não descarta páginas carregadas em "Carregar mais".
++  if (!automatic || state.history.length <= HISTORY_PAGE) tasks.push(loadHistory());
++  await Promise.allSettled(tasks);
++}
++
++async function loadProducts() {
++  try {
++    state.products = await api('/produtos');
++    renderCategories();
++    renderProducts();
++  } catch (error) {
++    if (error.status !== 401) toast(error.message, true);
++  } finally {
++    el('products').setAttribute('aria-busy', 'false');
++  }
++}
++
++async function loadSummary() {
++  try {
++    const summary = await api('/resumo');
++    el('kpi-out').textContent = summary.units_out_today;
++    el('kpi-out-detail').textContent = `${summary.marketplace_sales_today} marketplace · ${summary.manual_sales_today} manual · ${summary.losses_today} perda`;
++    el('kpi-in').textContent = summary.units_in_today;
++    el('kpi-stock').textContent = summary.total_stock;
++    el('kpi-available').textContent = summary.total_available;
++    el('kpi-reserved').textContent = summary.total_reserved
++      ? `${units(summary.total_reserved)} reservadas em PIX`
++      : 'nenhuma reserva PIX aberta';
++  } catch (error) {
++    if (error.status !== 401) toast(error.message, true);
++  }
++}
++
++const HISTORY_PAGE = 30;
++let historyRequest = 0;
++
++async function loadHistory(append = false) {
++  // Só a resposta da requisição mais recente é aplicada (cliques rápidos nos
++  // filtros ou um refresh automático não embaralham a lista).
++  const requestId = ++historyRequest;
++  const params = new URLSearchParams({ limit: String(HISTORY_PAGE) });
++  if (state.historyDirection) params.set('direction', state.historyDirection);
++  if (append && state.history.length) params.set('before_id', state.history[state.history.length - 1].id);
++  try {
++    const page = await api(`/movimentos?${params}`);
++    if (requestId !== historyRequest) return;
++    state.history = append ? state.history.concat(page) : page;
++    state.historyHasMore = page.length === HISTORY_PAGE;
++    renderHistory();
++  } catch (error) {
++    if (requestId === historyRequest && error.status !== 401) toast(error.message, true);
++  }
++}
++
++function startRefresh() {
++  stopRefresh();
++  state.refreshTimer = setInterval(() => {
++    if (document.visibilityState !== 'visible' || el('movement-dialog').open || !state.user) return;
++    refreshAll({ automatic: true });
++  }, REFRESH_MS);
++}
++
++function stopRefresh() {
++  if (state.refreshTimer) clearInterval(state.refreshTimer);
++  state.refreshTimer = null;
++}
++
++/* ------------------------------------------------------------ Render ----- */
++
++function renderCategories() {
++  const categories = [...new Set(state.products.map(product => product.category))].sort();
++  if (state.category && !categories.includes(state.category)) state.category = '';
++  const chips = [['', 'Todos'], ...categories.map(category => [category, category])];
++  el('category-filters').innerHTML = chips.map(([value, label]) => (
++    `<button type="button" class="chip${state.category === value ? ' active' : ''}" data-category="${escapeHtml(value)}">${escapeHtml(label)}</button>`
++  )).join('');
++}
++
++function stockBadge(product) {
++  if (product.available <= 0) return '<span class="badge empty">Esgotado no marketplace</span>';
++  if (product.available <= LOW_STOCK) return `<span class="badge low">Estoque baixo</span>`;
++  return `<span class="badge">${escapeHtml(product.category)}</span>`;
++}
++
++function productCard(product) {
++  const isAdmin = state.user && state.user.role === 'ADMIN';
++  const reserved = product.reserved_stock
++    ? `<span><strong>${product.reserved_stock}</strong> reservada(s) PIX</span>`
++    : '';
++  return `
++    <article class="card" data-id="${escapeHtml(product.id)}">
++      <div class="card-top">
++        <div class="card-image"><img src="${productImage(product)}" alt="" loading="lazy"></div>
++        <div class="card-title">
++          <h3>${escapeHtml(product.name)}</h3>
++          ${stockBadge(product)}
++        </div>
++      </div>
++      <div class="card-stock">
++        <div class="stock-number">
++          <b>${product.stock}</b>
++          <small>${product.stock === 1 ? 'lata em estoque' : 'latas em estoque'}</small>
++        </div>
++        <div class="stock-meta">
++          <span><strong>${product.available}</strong> no marketplace</span>
++          ${reserved}
++          <span>saíram hoje: <strong>${product.out_today}</strong></span>
++        </div>
++      </div>
++      <div class="card-actions">
++        <button type="button" class="btn-out" data-action="out" ${product.available <= 0 ? 'disabled' : ''} aria-label="Registrar saída de ${escapeHtml(product.name)}"><span class="sign" aria-hidden="true">−</span> Saída</button>
++        <button type="button" class="btn-in" data-action="in" aria-label="Registrar entrada de ${escapeHtml(product.name)}"><span class="sign" aria-hidden="true">+</span> Entrada</button>
++      </div>
++      ${isAdmin ? `<button type="button" class="adjust-link" data-action="adjust">Ajustar contagem</button>` : ''}
++    </article>`;
++}
++
++function renderProducts() {
++  const term = normalizeId(state.search);
++  const visible = state.products.filter(product => (
++    (!state.category || product.category === state.category)
++    && (!term || normalizeId(product.name).includes(term) || normalizeId(product.id).includes(term))
++  ));
++  el('products').innerHTML = visible.length
++    ? visible.map(productCard).join('')
++    : `<p class="empty-state">${state.products.length ? 'Nenhum sabor encontrado com esse filtro.' : 'Nenhum sabor cadastrado ainda. Rode sql/seed_sabores.sql para cadastrar o catálogo.'}</p>`;
++}
++
++function historyItem(movement) {
++  const direction = movement.delta < 0 ? 'out' : 'in';
++  const who = [];
++  if (movement.buyer_name) who.push(`comprador: <b>${escapeHtml(movement.buyer_name)}</b>`);
++  if (movement.staff_name) who.push(`por ${escapeHtml(movement.staff_name)}`);
++  if (movement.unit_price != null) who.push(money(movement.unit_price * movement.quantity));
++  if (movement.note) who.push(`“${escapeHtml(movement.note)}”`);
++  return `
++    <li class="history-item">
++      <span class="history-delta ${direction}">${movement.delta > 0 ? '+' : '−'}${movement.quantity}</span>
++      <div class="history-body">
++        <b>${escapeHtml(movement.product_name)}</b>
++        <span><span class="type ${escapeHtml(movement.movement_type)}">${TYPE_LABELS[movement.movement_type] || escapeHtml(movement.movement_type)}</span>${who.join(' · ')}</span>
++        <span>estoque ${movement.stock_before} → ${movement.stock_after}</span>
++      </div>
++      <time class="history-time" datetime="${escapeHtml(movement.created_at)}">${formatWhen(movement.created_at)}</time>
++    </li>`;
++}
++
++function renderHistory() {
++  el('history').innerHTML = state.history.length
++    ? state.history.map(historyItem).join('')
++    : '<li class="history-empty">Nenhuma movimentação registrada ainda.</li>';
++  el('history-more').classList.toggle('hidden', !state.historyHasMore);
++}
++
++function flashCard(productId, direction) {
++  const card = document.querySelector(`.card[data-id="${CSS.escape(productId)}"]`);
++  if (!card) return;
++  card.classList.remove('flash-in', 'flash-out');
++  void card.offsetWidth;
++  card.classList.add(direction === 'out' ? 'flash-out' : 'flash-in');
++}
++
++/* ------------------------------------------------------------ Diálogo ---- */
++
++function selectedType() {
++  const checked = document.querySelector('input[name="movement-type"]:checked');
++  return checked ? checked.value : null;
++}
++
++function quantityValue() {
++  const value = Number.parseInt(el('movement-quantity').value, 10);
++  return Number.isFinite(value) ? value : 0;
++}
++
++function maxQuantity() {
++  const { product, mode } = state.dialog;
++  return mode === 'out' ? Math.max(product.available, 0) : 500;
++}
++
++function openMovement(productId, mode) {
++  const product = state.products.find(item => item.id === productId);
++  if (!product) return;
++  const config = MODES[mode];
++  state.dialog = { product, mode };
++
++  el('movement-image').src = productImage(product);
++  el('movement-eyebrow').textContent = config.eyebrow;
++  el('movement-title').textContent = product.name;
++  el('movement-stock').textContent = describeStock(product);
++  el('type-field').innerHTML = config.types.map((type, index) => `
++    <div class="type-option">
++      <input type="radio" id="type-${type.value}" name="movement-type" value="${type.value}" ${index === 0 ? 'checked' : ''}>
++      <label for="type-${type.value}">${type.title}<small>${type.hint}</small></label>
++    </div>`).join('');
++  // Com um único tipo possível não há o que escolher: o rádio fica marcado e oculto.
++  el('type-field').classList.toggle('hidden', config.types.length === 1);
++
++  el('movement-quantity').value = '1';
++  el('movement-quantity').max = String(maxQuantity());
++  el('movement-counted').value = String(product.stock);
++  el('movement-buyer').value = '';
++  el('movement-email').value = '';
++  el('movement-note').value = '';
++  el('movement-error').textContent = '';
++  for (const id of ['movement-buyer', 'movement-email', 'movement-note', 'movement-counted', 'movement-quantity']) {
++    el(id).removeAttribute('aria-invalid');
++  }
++
++  const submit = el('movement-submit');
++  submit.querySelector('.button-label').textContent = config.submit;
++  submit.classList.toggle('danger', config.danger);
++  syncDialog();
++  el('movement-dialog').showModal();
++  setTimeout(() => (mode === 'adjust' ? el('movement-counted') : el('movement-quantity')).select(), 30);
++}
++
++function describeStock(product) {
++  return `${units(product.stock)} em estoque · ${product.available} disponível(is) no marketplace`;
++}
++
++function refreshDialogProduct() {
++  if (!state.dialog) return;
++  const fresh = state.products.find(item => item.id === state.dialog.product.id);
++  if (!fresh) return;
++  state.dialog.product = fresh;
++  el('movement-stock').textContent = describeStock(fresh);
++  el('movement-quantity').max = String(maxQuantity());
++  syncDialog();
++}
++
++function closeDialog() {
++  // Enquanto o lançamento está sendo enviado, o diálogo não fecha: o
++  // resultado (sucesso ou erro) precisa aparecer para o operador.
++  if (!state.submitting) el('movement-dialog').close();
++}
++
++function syncDialog() {
++  if (!state.dialog) return;
++  const { product, mode } = state.dialog;
++  const type = selectedType();
++  const isSale = type === 'MANUAL_SALE';
++  const isAdjust = mode === 'adjust';
++
++  el('quantity-field').classList.toggle('hidden', isAdjust);
++  el('counted-field').classList.toggle('hidden', !isAdjust);
++  el('buyer-field').classList.toggle('hidden', !isSale);
++  el('email-field').classList.toggle('hidden', !isSale);
++  el('note-optional').textContent = isAdjust ? '(obrigatória)' : '(opcional)';
++  el('movement-note').placeholder = isAdjust
++    ? 'Ex.: contagem semanal, divergência encontrada…'
++    : type === 'LOSS' ? 'Ex.: lata amassada, vazou…' : 'Ex.: lote recebido, pago em dinheiro…';
++
++  let next;
++  if (isAdjust) {
++    next = Number.parseInt(el('movement-counted').value, 10);
++    if (!Number.isFinite(next)) next = product.stock;
++  } else {
++    const quantity = quantityValue();
++    next = mode === 'out' ? product.stock - quantity : product.stock + quantity;
++  }
++  const delta = next - product.stock;
++  const sign = delta > 0 ? '+' : delta < 0 ? '−' : '';
++  el('movement-preview').innerHTML = `Estoque de ${escapeHtml(product.name)}: <b>${product.stock} → ${next}</b> (${sign}${Math.abs(delta)})`;
++  el('qty-minus').disabled = quantityValue() <= 1;
++  el('qty-plus').disabled = quantityValue() >= maxQuantity();
++}
++
++function setQuantity(value) {
++  const clamped = Math.min(Math.max(value, 1), Math.max(maxQuantity(), 1));
++  el('movement-quantity').value = String(clamped);
++  syncDialog();
++}
++
++function validateDialog() {
++  const { product, mode } = state.dialog;
++  const type = selectedType();
++  const errors = [];
++  const flag = (id, bad) => {
++    if (bad) el(id).setAttribute('aria-invalid', 'true');
++    else el(id).removeAttribute('aria-invalid');
++    return bad;
++  };
++
++  const payload = { product_id: product.id, movement_type: type };
++  if (mode === 'adjust') {
++    const counted = Number.parseInt(el('movement-counted').value, 10);
++    if (flag('movement-counted', !Number.isFinite(counted) || counted < 0 || counted > 10000)) errors.push('Informe a contagem física (0 a 10000).');
++    else if (counted === product.stock) errors.push('A contagem é igual ao estoque atual.');
++    else if (counted < product.reserved_stock) errors.push(`${product.reserved_stock} lata(s) estão reservadas em PIX; a contagem não pode ser menor.`);
++    payload.counted_stock = counted;
++  } else {
++    const quantity = quantityValue();
++    const max = maxQuantity();
++    if (flag('movement-quantity', quantity < 1 || quantity > max)) {
++      errors.push(max < 1 ? 'Não há latas disponíveis para saída.' : `A quantidade deve ser entre 1 e ${max}.`);
++    }
++    payload.quantity = quantity;
++  }
++
++  if (type === 'MANUAL_SALE') {
++    const buyer = el('movement-buyer').value.trim();
++    if (flag('movement-buyer', buyer.length < 2)) errors.push('Informe o nome de quem comprou.');
++    payload.buyer_name = buyer;
++    const email = el('movement-email').value.trim();
++    if (flag('movement-email', Boolean(email) && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) errors.push('E-mail inválido.');
++    if (email) payload.buyer_email = email;
++  }
++
++  const note = el('movement-note').value.trim();
++  if (flag('movement-note', mode === 'adjust' && !note)) errors.push('Explique o motivo do ajuste.');
++  if (note) payload.note = note;
++
++  return { payload, errors };
++}
++
++async function onSubmitMovement(event) {
++  event.preventDefault();
++  if (!state.dialog || state.submitting) return;
++  const { payload, errors } = validateDialog();
++  if (errors.length) {
++    el('movement-error').textContent = errors.join(' ');
++    return;
++  }
++  const button = el('movement-submit');
++  state.submitting = true;
++  button.disabled = true;
++  button.classList.add('loading');
++  el('movement-error').textContent = '';
++  try {
++    const result = await api('/movimentos', { method: 'POST', body: JSON.stringify(payload) });
++    const index = state.products.findIndex(item => item.id === result.product.id);
++    if (index >= 0) state.products[index] = result.product;
++    el('movement-dialog').close();
++    renderProducts();
++    const { movement } = result;
++    flashCard(movement.product_id, movement.delta < 0 ? 'out' : 'in');
++    const buyer = movement.buyer_name ? ` para ${movement.buyer_name}` : '';
++    toast(`${TYPE_LABELS[movement.movement_type]}: ${movement.delta > 0 ? '+' : '−'}${movement.quantity} ${movement.product_name}${buyer}. Estoque agora: ${movement.stock_after}.`);
++    loadSummary();
++    loadHistory();
++  } catch (error) {
++    el('movement-error').textContent = error.message;
++    if (error.status === 409) {
++      await loadProducts();
++      refreshDialogProduct();
++    }
++  } finally {
++    state.submitting = false;
++    button.disabled = false;
++    button.classList.remove('loading');
++  }
++}
++
++/* ------------------------------------------------------------ Eventos ---- */
++
++function bindEvents() {
++  el('login-form').addEventListener('submit', onLogin);
++  el('logout').addEventListener('click', onLogout);
++
++  el('products').addEventListener('click', event => {
++    const button = event.target.closest('button[data-action]');
++    if (!button || button.disabled) return;
++    const card = button.closest('.card');
++    openMovement(card.dataset.id, button.dataset.action);
++  });
++
++  el('category-filters').addEventListener('click', event => {
++    const chip = event.target.closest('.chip');
++    if (!chip) return;
++    state.category = chip.dataset.category;
++    renderCategories();
++    renderProducts();
++  });
++
++  el('search').addEventListener('input', event => {
++    state.search = event.target.value;
++    renderProducts();
++  });
++
++  document.querySelector('.history .filters').addEventListener('click', event => {
++    const chip = event.target.closest('.chip');
++    if (!chip) return;
++    document.querySelectorAll('.history .chip').forEach(node => node.classList.toggle('active', node === chip));
++    state.historyDirection = chip.dataset.direction;
++    loadHistory();
++  });
++  el('history-more').addEventListener('click', () => loadHistory(true));
++
++  const dialog = el('movement-dialog');
++  el('movement-form').addEventListener('submit', onSubmitMovement);
++  el('movement-form').addEventListener('input', event => {
++    if (event.target.hasAttribute('aria-invalid')) event.target.removeAttribute('aria-invalid');
++    syncDialog();
++  });
++  el('movement-form').addEventListener('change', syncDialog);
++  dialog.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', closeDialog));
++  dialog.addEventListener('cancel', event => { if (state.submitting) event.preventDefault(); });
++  dialog.addEventListener('close', () => { state.dialog = null; });
++  dialog.addEventListener('click', event => { if (event.target === dialog) closeDialog(); });
++  el('qty-minus').addEventListener('click', () => setQuantity(quantityValue() - 1));
++  el('qty-plus').addEventListener('click', () => setQuantity(quantityValue() + 1));
++
++  document.addEventListener('visibilitychange', () => {
++    if (document.visibilityState === 'visible' && state.user && !dialog.open) refreshAll({ automatic: true });
++  });
++}
++
++async function boot() {
++  bindEvents();
++  try {
++    const user = await api('/me');
++    showPanel(user);
++  } catch {
++    showLogin();
++  }
++}
++
++boot();
+diff --git a/app/stock_panel.py b/app/stock_panel.py
+new file mode 100644
+index 0000000..2b104ee
+--- /dev/null
++++ b/app/stock_panel.py
+@@ -0,0 +1,159 @@
++"""Rotas do painel de controle de estoque (``/estoque`` e ``/api/estoque/*``).
++
++As rotas são finas: autenticação fica em ``staff_auth`` e as regras de
++estoque em ``stock_service``.
++"""
++
++from pathlib import Path
++from typing import Literal
++
++from fastapi import APIRouter, Depends, Query, Request, Response
++from fastapi.responses import FileResponse
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from .db.base import get_db
++from .models import (
++    StaffLogin,
++    StaffUser,
++    StockMovement,
++    StockMovementCreate,
++    StockMovementResult,
++    StockProduct,
++    StockSummary,
++)
++from .staff_auth import (
++    SESSION_COOKIE_NAME,
++    StaffPrincipal,
++    authenticate,
++    clear_session_cookie,
++    require_panel_header,
++    require_staff,
++    revoke_session,
++    set_session_cookie,
++)
++from .stock_service import (
++    apply_panel_movement,
++    list_movements,
++    list_stock_products,
++    stock_summary,
++)
++
++PANEL_HTML = Path(__file__).resolve().parent / "templates" / "estoque.html"
++NO_STORE = {"Cache-Control": "no-store"}
++PANEL_PAGE_HEADERS = {
++    **NO_STORE,
++    "X-Frame-Options": "DENY",
++    "X-Content-Type-Options": "nosniff",
++    "Referrer-Policy": "same-origin",
++    "Content-Security-Policy": (
++        "default-src 'self'; img-src 'self' data:; style-src 'self'; "
++        "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; "
++        "base-uri 'none'; form-action 'self'"
++    ),
++}
++
++router = APIRouter()
++api = APIRouter(prefix="/api/estoque", tags=["estoque"])
++
++
++@router.get("/estoque", include_in_schema=False)
++def stock_panel_page() -> FileResponse:
++    # O HTML fica fora de /static para só existir com estes cabeçalhos.
++    return FileResponse(PANEL_HTML, headers=PANEL_PAGE_HEADERS)
++
++
++@api.post(
++    "/login",
++    response_model=StaffUser,
++    dependencies=[Depends(require_panel_header)],
++)
++async def login(
++    payload: StaffLogin,
++    request: Request,
++    response: Response,
++    db: AsyncSession = Depends(get_db),
++) -> StaffUser:
++    staff, token = await authenticate(
++        db,
++        payload.username,
++        payload.password,
++        user_agent=request.headers.get("user-agent"),
++        ip_address=request.client.host if request.client else None,
++    )
++    set_session_cookie(response, token)
++    response.headers.update(NO_STORE)
++    return staff
++
++
++@api.post("/logout", status_code=204, dependencies=[Depends(require_panel_header)])
++async def logout(request: Request, db: AsyncSession = Depends(get_db)) -> Response:
++    await revoke_session(db, request.cookies.get(SESSION_COOKIE_NAME))
++    response = Response(status_code=204)
++    clear_session_cookie(response)
++    return response
++
++
++@api.get("/me", response_model=StaffUser)
++async def me(
++    response: Response,
++    staff: StaffPrincipal = Depends(require_staff),
++) -> StaffUser:
++    response.headers.update(NO_STORE)
++    return staff.to_model()
++
++
++@api.get("/produtos", response_model=list[StockProduct])
++async def stock_products(
++    response: Response,
++    _: StaffPrincipal = Depends(require_staff),
++    db: AsyncSession = Depends(get_db),
++) -> list[StockProduct]:
++    response.headers.update(NO_STORE)
++    return await list_stock_products(db)
++
++
++@api.post(
++    "/movimentos",
++    response_model=StockMovementResult,
++    status_code=201,
++    dependencies=[Depends(require_panel_header)],
++)
++async def create_movement(
++    payload: StockMovementCreate,
++    staff: StaffPrincipal = Depends(require_staff),
++    db: AsyncSession = Depends(get_db),
++) -> StockMovementResult:
++    return await apply_panel_movement(db, payload, staff.to_model())
++
++
++@api.get("/movimentos", response_model=list[StockMovement])
++async def movements(
++    response: Response,
++    product_id: str | None = Query(None, max_length=50),
++    direction: Literal["in", "out"] | None = None,
++    limit: int = Query(50, ge=1, le=200),
++    before_id: int | None = Query(None, ge=1),
++    _: StaffPrincipal = Depends(require_staff),
++    db: AsyncSession = Depends(get_db),
++) -> list[StockMovement]:
++    response.headers.update(NO_STORE)
++    return await list_movements(
++        db,
++        product_id=product_id,
++        direction=direction,
++        limit=limit,
++        before_id=before_id,
++    )
++
++
++@api.get("/resumo", response_model=StockSummary)
++async def summary(
++    response: Response,
++    _: StaffPrincipal = Depends(require_staff),
++    db: AsyncSession = Depends(get_db),
++) -> StockSummary:
++    response.headers.update(NO_STORE)
++    return await stock_summary(db)
++
++
++router.include_router(api)
+diff --git a/app/stock_service.py b/app/stock_service.py
+new file mode 100644
+index 0000000..e9db1e0
+--- /dev/null
++++ b/app/stock_service.py
+@@ -0,0 +1,363 @@
++"""Regras do controle de estoque (painel /estoque e registro de vendas).
++
++O livro-razão ``stock_movements`` é escrito pelo trigger
++``trg_products_stock_ledger`` sempre que ``products.stock`` muda. A aplicação
++apenas informa *quem*, *por quê* e *para quem* por meio de
++``set_stock_context``, chamado na mesma transação que altera o estoque.
++
++Assim como em ``payment_service``, toda alteração de estoque segue o padrão:
++``SELECT ... FOR UPDATE`` no produto dentro de ``db.begin()``, revalidação do
++estado atual e só então a mutação.
++"""
++
++import json
++import logging
++import os
++from datetime import datetime
++from uuid import UUID
++
++from fastapi import HTTPException
++from sqlalchemy import and_, case, func, select, text
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from .db.models import ProductORM, StaffUserORM, StockMovementORM
++from .models import (
++    StaffRole,
++    StaffUser,
++    StockMovement,
++    StockMovementCreate,
++    StockMovementResult,
++    StockMovementSource,
++    StockMovementType,
++    StockProduct,
++    StockSummary,
++)
++
++logger = logging.getLogger(__name__)
++
++STOCK_CONTEXT_SETTING = "redbull.stock_context"
++MAX_PHYSICAL_STOCK = 10000
++# "Saídas" e "entradas" dos totais do dia contam só movimentos reais de latas.
++# Ajustes de inventário e alterações sem contexto são correções: aparecem no
++# histórico, mas não inflam os totais.
++OUT_TYPES = (
++    StockMovementType.MARKETPLACE_SALE.value,
++    StockMovementType.MANUAL_SALE.value,
++    StockMovementType.LOSS.value,
++)
++IN_TYPES = (
++    StockMovementType.RESTOCK.value,
++    StockMovementType.INITIAL_STOCK.value,
++)
++
++
++def stock_timezone() -> str:
++    return os.getenv("STOCK_TIMEZONE", "America/Recife").strip() or "America/Recife"
++
++
++def _start_of_local_day():
++    """Início do dia corrente no fuso do ponto de venda, calculado no banco."""
++    tz = stock_timezone()
++    return func.timezone(tz, func.date_trunc("day", func.timezone(tz, func.now())))
++
++
++async def set_stock_context(
++    db: AsyncSession,
++    *,
++    movement_type: StockMovementType,
++    source: StockMovementSource,
++    order_id: UUID | None = None,
++    staff_user_id: int | None = None,
++    buyer_name: str | None = None,
++    buyer_email: str | None = None,
++    note: str | None = None,
++) -> None:
++    """Informa ao trigger o contexto da próxima alteração de estoque.
++
++    Usa ``set_config(..., true)``: o valor vale só até o fim da transação
++    atual, então é seguro com pool de conexões. Precisa ser chamado dentro
++    da mesma transação que altera ``products.stock``.
++    """
++    payload = {
++        "movement_type": movement_type.value,
++        "source": source.value,
++        "order_id": str(order_id) if order_id else None,
++        "staff_user_id": staff_user_id,
++        "buyer_name": buyer_name,
++        "buyer_email": buyer_email,
++        "note": note,
++    }
++    await db.execute(
++        text("SELECT set_config(:name, :value, true)"),
++        {
++            "name": STOCK_CONTEXT_SETTING,
++            "value": json.dumps(
++                {key: value for key, value in payload.items() if value is not None},
++                ensure_ascii=False,
++            ),
++        },
++    )
++
++
++def _movement_to_model(
++    movement: StockMovementORM,
++    staff: StaffUserORM | None,
++) -> StockMovement:
++    return StockMovement(
++        id=movement.id,
++        product_id=movement.product_id,
++        product_name=movement.product_name,
++        movement_type=StockMovementType(movement.movement_type),
++        source=StockMovementSource(movement.source),
++        quantity=movement.quantity,
++        delta=movement.delta,
++        stock_before=movement.stock_before,
++        stock_after=movement.stock_after,
++        order_id=movement.order_id,
++        buyer_name=movement.buyer_name,
++        buyer_email=movement.buyer_email,
++        unit_price=float(movement.unit_price) if movement.unit_price is not None else None,
++        note=movement.note,
++        staff_username=staff.username if staff else None,
++        staff_name=staff.full_name if staff else None,
++        created_at=movement.created_at,
++    )
++
++
++def _product_to_stock_model(
++    product: ProductORM,
++    out_today: int = 0,
++    last_movement_at: datetime | None = None,
++) -> StockProduct:
++    return StockProduct(
++        id=product.id,
++        name=product.name,
++        category=product.category,
++        stock=product.stock,
++        reserved_stock=product.reserved_stock,
++        available=product.stock - product.reserved_stock,
++        out_today=out_today,
++        last_movement_at=last_movement_at,
++    )
++
++
++async def list_stock_products(db: AsyncSession) -> list[StockProduct]:
++    out_today = (
++        select(
++            StockMovementORM.product_id.label("product_id"),
++            func.sum(-StockMovementORM.delta).label("units"),
++        )
++        .where(
++            StockMovementORM.movement_type.in_(OUT_TYPES),
++            StockMovementORM.created_at >= _start_of_local_day(),
++        )
++        .group_by(StockMovementORM.product_id)
++        .subquery()
++    )
++    last_movement = (
++        select(
++            StockMovementORM.product_id.label("product_id"),
++            func.max(StockMovementORM.created_at).label("last_at"),
++        )
++        .group_by(StockMovementORM.product_id)
++        .subquery()
++    )
++    rows = await db.execute(
++        select(ProductORM, out_today.c.units, last_movement.c.last_at)
++        .outerjoin(out_today, out_today.c.product_id == ProductORM.id)
++        .outerjoin(last_movement, last_movement.c.product_id == ProductORM.id)
++        .order_by(ProductORM.category, ProductORM.name)
++    )
++    return [
++        _product_to_stock_model(product, int(units or 0), last_at)
++        for product, units, last_at in rows
++    ]
++
++
++async def apply_panel_movement(
++    db: AsyncSession,
++    payload: StockMovementCreate,
++    staff: StaffUser,
++) -> StockMovementResult:
++    """Lança uma entrada/saída manual de forma atômica e auditada."""
++    movement_type = payload.movement_type
++    if movement_type == StockMovementType.ADJUSTMENT and staff.role != StaffRole.ADMIN:
++        raise HTTPException(403, "Somente administradores podem ajustar o inventário")
++
++    async with db.begin():
++        product = (
++            await db.execute(
++                select(ProductORM)
++                .where(ProductORM.id == payload.product_id)
++                .with_for_update()
++                .execution_options(populate_existing=True)
++            )
++        ).scalar_one_or_none()
++        if product is None:
++            raise HTTPException(404, "Sabor não encontrado")
++
++        if movement_type == StockMovementType.ADJUSTMENT:
++            new_stock = payload.counted_stock
++        elif movement_type == StockMovementType.RESTOCK:
++            new_stock = product.stock + payload.quantity
++        else:
++            new_stock = product.stock - payload.quantity
++
++        if new_stock == product.stock:
++            raise HTTPException(409, "A contagem informada é igual ao estoque atual")
++        if new_stock > MAX_PHYSICAL_STOCK:
++            raise HTTPException(
++                422, f"O estoque não pode passar de {MAX_PHYSICAL_STOCK} unidades"
++            )
++        if new_stock < 0 and product.reserved_stock == 0:
++            raise HTTPException(
++                409,
++                f"Estoque insuficiente: há apenas {product.stock} lata(s) de {product.name}.",
++            )
++        if new_stock < product.reserved_stock:
++            available = max(product.stock - product.reserved_stock, 0)
++            raise HTTPException(
++                409,
++                f"Só há {available} lata(s) de {product.name} livre(s) para saída: "
++                f"{product.reserved_stock} estão reservadas para pagamentos PIX em andamento.",
++            )
++
++        previous_stock = product.stock
++        await set_stock_context(
++            db,
++            movement_type=movement_type,
++            source=StockMovementSource.PAINEL,
++            staff_user_id=staff.id,
++            buyer_name=payload.buyer_name,
++            buyer_email=payload.buyer_email,
++            note=payload.note,
++        )
++        product.stock = new_stock
++        await db.flush()
++
++        # O produto está travado nesta transação: a última linha do
++        # livro-razão para ele deve ser a que o trigger acabou de inserir.
++        # Se não for (trigger ausente/desativado ou contexto descartado), a
++        # transação inteira é desfeita: estoque nunca muda sem registro.
++        movement = (
++            await db.execute(
++                select(StockMovementORM)
++                .where(StockMovementORM.product_id == product.id)
++                .order_by(StockMovementORM.id.desc())
++                .limit(1)
++            )
++        ).scalar_one_or_none()
++        if (
++            movement is None
++            or movement.movement_type != movement_type.value
++            or movement.staff_user_id != staff.id
++            or movement.stock_before != previous_stock
++            or movement.stock_after != new_stock
++        ):
++            logger.error(
++                "Livro-razão de estoque não registrou a movimentação do painel: "
++                "product_id=%s movement_type=%s",
++                product.id,
++                movement_type.value,
++            )
++            raise HTTPException(
++                500,
++                "Não foi possível registrar a movimentação no histórico. Nada foi alterado.",
++            )
++        out_today = (
++            await db.execute(
++                select(func.coalesce(func.sum(-StockMovementORM.delta), 0)).where(
++                    StockMovementORM.product_id == product.id,
++                    StockMovementORM.movement_type.in_(OUT_TYPES),
++                    StockMovementORM.created_at >= _start_of_local_day(),
++                )
++            )
++        ).scalar_one()
++        staff_row = await db.get(StaffUserORM, staff.id)
++        result = StockMovementResult(
++            movement=_movement_to_model(movement, staff_row),
++            product=_product_to_stock_model(
++                product,
++                out_today=int(out_today),
++                last_movement_at=movement.created_at,
++            ),
++        )
++
++    return result
++
++
++async def list_movements(
++    db: AsyncSession,
++    *,
++    product_id: str | None = None,
++    direction: str | None = None,
++    limit: int = 50,
++    before_id: int | None = None,
++) -> list[StockMovement]:
++    query = (
++        select(StockMovementORM, StaffUserORM)
++        .outerjoin(StaffUserORM, StaffUserORM.id == StockMovementORM.staff_user_id)
++        .order_by(StockMovementORM.id.desc())
++        .limit(limit)
++    )
++    if product_id:
++        query = query.where(StockMovementORM.product_id == product_id)
++    if direction == "out":
++        query = query.where(StockMovementORM.delta < 0)
++    elif direction == "in":
++        query = query.where(StockMovementORM.delta > 0)
++    if before_id:
++        query = query.where(StockMovementORM.id < before_id)
++    rows = await db.execute(query)
++    return [_movement_to_model(movement, staff) for movement, staff in rows]
++
++
++async def stock_summary(db: AsyncSession) -> StockSummary:
++    today = _start_of_local_day()
++    is_today = StockMovementORM.created_at >= today
++
++    def units_where(*conditions):
++        return func.coalesce(
++            func.sum(case((and_(is_today, *conditions), StockMovementORM.quantity), else_=0)),
++            0,
++        )
++
++    movement_totals = (
++        await db.execute(
++            select(
++                units_where(StockMovementORM.movement_type.in_(OUT_TYPES)),
++                units_where(StockMovementORM.movement_type.in_(IN_TYPES)),
++                units_where(
++                    StockMovementORM.movement_type == StockMovementType.MARKETPLACE_SALE.value
++                ),
++                units_where(
++                    StockMovementORM.movement_type == StockMovementType.MANUAL_SALE.value
++                ),
++                units_where(StockMovementORM.movement_type == StockMovementType.LOSS.value),
++            ).where(is_today)
++        )
++    ).one()
++    stock_totals = (
++        await db.execute(
++            select(
++                func.coalesce(func.sum(ProductORM.stock), 0),
++                func.coalesce(func.sum(ProductORM.reserved_stock), 0),
++            )
++        )
++    ).one()
++    local_day = (
++        await db.execute(select(func.to_char(func.timezone(stock_timezone(), func.now()), "YYYY-MM-DD")))
++    ).scalar_one()
++    total_stock, total_reserved = (int(value) for value in stock_totals)
++    out_today, in_today, marketplace, manual, losses = (int(value) for value in movement_totals)
++    return StockSummary(
++        day=local_day,
++        units_out_today=out_today,
++        units_in_today=in_today,
++        marketplace_sales_today=marketplace,
++        manual_sales_today=manual,
++        losses_today=losses,
++        total_stock=total_stock,
++        total_reserved=total_reserved,
++        total_available=total_stock - total_reserved,
++    )
+diff --git a/app/store.py b/app/store.py
+index d10ad91..02dde82 100644
+--- a/app/store.py
++++ b/app/store.py
+@@ -27,7 +27,10 @@ from .models import (
+     PricingAudience,
+     Product,
+     ReservationStatus,
++    StockMovementSource,
++    StockMovementType,
+ )
++from .stock_service import set_stock_context
+ 
+ 
+ @dataclass(frozen=True)
+@@ -362,6 +365,12 @@ class DatabaseStore:
+                     raise HTTPException(
+                         409, "Estoque insuficiente para concluir o pagamento"
+                     )
++            await set_stock_context(
++                db,
++                movement_type=StockMovementType.MARKETPLACE_SALE,
++                source=StockMovementSource.MARKETPLACE,
++                order_id=order.id,
++            )
+             for product_id in product_ids:
+                 quantity = quantities[product_id]
+                 products[product_id].stock -= quantity
+diff --git a/app/templates/estoque.html b/app/templates/estoque.html
+new file mode 100644
+index 0000000..b7813aa
+--- /dev/null
++++ b/app/templates/estoque.html
+@@ -0,0 +1,164 @@
++<!doctype html>
++<html lang="pt-BR">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
++  <meta name="theme-color" content="#070d16">
++  <meta name="robots" content="noindex, nofollow">
++  <title>Estoque Red Bull — CITi</title>
++  <link rel="stylesheet" href="/static/estoque/estoque.css?v=20261009-1">
++</head>
++<body>
++  <!-- Login -->
++  <main id="login-view" class="login-shell hidden" aria-labelledby="login-title">
++    <form id="login-form" class="login-card" novalidate>
++      <img class="login-logo" src="/static/assets/logo-citi-transparent.png?v=20260802-2" alt="CITi">
++      <p class="eyebrow">Área restrita</p>
++      <h1 id="login-title">Controle de <span>estoque</span></h1>
++      <p class="muted">Entre com seu usuário de operador para registrar entradas e saídas de Red Bull.</p>
++
++      <label for="login-username">Usuário</label>
++      <div class="input-wrap">
++        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 21a8 8 0 0 0-16 0M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z"/></svg>
++        <input id="login-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="50" placeholder="seu.usuario">
++      </div>
++
++      <label for="login-password">Senha</label>
++      <div class="input-wrap">
++        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>
++        <input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="200" placeholder="••••••••">
++      </div>
++
++      <p id="login-error" class="form-error" role="alert" aria-live="assertive"></p>
++
++      <button type="submit" id="login-submit" class="primary-button">
++        <span class="button-label">Entrar</span>
++        <span class="button-loader" aria-hidden="true"></span>
++      </button>
++    </form>
++  </main>
++
++  <!-- Painel -->
++  <div id="panel-view" class="panel-shell hidden">
++    <header class="topbar">
++      <div class="topbar-brand">
++        <img src="/static/assets/logo-citi-transparent.png?v=20260802-2" alt="CITi">
++        <div>
++          <p class="eyebrow">Red Bull no CITi</p>
++          <h1>Controle de <span>estoque</span></h1>
++        </div>
++      </div>
++      <div class="topbar-user">
++        <span class="user-chip"><b id="user-name">—</b><small id="user-role">—</small></span>
++        <button type="button" id="logout" class="ghost-button" aria-label="Sair do painel">
++          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M15 17l5-5-5-5M20 12H9M12 21H5V3h7"/></svg>
++          <span class="logout-label">Sair</span>
++        </button>
++      </div>
++    </header>
++
++    <section class="kpis" aria-label="Resumo do dia">
++      <article class="kpi kpi-out"><small>Saíram hoje</small><b id="kpi-out">—</b><span id="kpi-out-detail">&nbsp;</span></article>
++      <article class="kpi"><small>Entraram hoje</small><b id="kpi-in">—</b><span>reposições lançadas</span></article>
++      <article class="kpi"><small>Estoque físico</small><b id="kpi-stock">—</b><span>latas no CITi</span></article>
++      <article class="kpi"><small>Disponível no marketplace</small><b id="kpi-available">—</b><span id="kpi-reserved">&nbsp;</span></article>
++    </section>
++
++    <div class="panel-grid">
++      <section class="flavors" aria-labelledby="flavors-title">
++        <div class="section-head">
++          <h2 id="flavors-title">Sabores</h2>
++          <div class="filters" role="group" aria-label="Filtrar por categoria" id="category-filters"></div>
++        </div>
++        <div class="search-wrap">
++          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m21 21-4.3-4.3M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z"/></svg>
++          <input id="search" type="search" placeholder="Buscar sabor" aria-label="Buscar sabor" autocomplete="off">
++        </div>
++        <div id="products" class="product-grid" aria-live="polite" aria-busy="true">
++          <div class="card skeleton"></div><div class="card skeleton"></div><div class="card skeleton"></div>
++        </div>
++      </section>
++
++      <section class="history" aria-labelledby="history-title">
++        <div class="section-head">
++          <h2 id="history-title">Movimentações</h2>
++          <div class="filters" role="group" aria-label="Filtrar movimentações">
++            <button type="button" class="chip active" data-direction="">Todas</button>
++            <button type="button" class="chip" data-direction="out">Saídas</button>
++            <button type="button" class="chip" data-direction="in">Entradas</button>
++          </div>
++        </div>
++        <ol id="history" class="history-list" aria-live="polite"></ol>
++        <button type="button" id="history-more" class="ghost-button wide hidden">Carregar mais</button>
++        <p class="muted small">Vendas pagas no marketplace aparecem aqui automaticamente.</p>
++      </section>
++    </div>
++  </div>
++
++  <!-- Lançamento de entrada/saída -->
++  <dialog id="movement-dialog" aria-labelledby="movement-title">
++    <form id="movement-form" method="dialog" novalidate>
++      <header class="dialog-head">
++        <div class="dialog-product">
++          <img id="movement-image" src="" alt="">
++          <div>
++            <p class="eyebrow" id="movement-eyebrow">Saída</p>
++            <h2 id="movement-title">—</h2>
++            <p class="muted small" id="movement-stock">—</p>
++          </div>
++        </div>
++        <button type="button" class="icon-button" data-close aria-label="Fechar">
++          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
++        </button>
++      </header>
++
++      <fieldset id="type-field" class="type-options">
++        <legend class="sr-only">Tipo de movimentação</legend>
++      </fieldset>
++
++      <div id="quantity-field" class="field">
++        <label for="movement-quantity">Quantidade</label>
++        <div class="stepper">
++          <button type="button" id="qty-minus" aria-label="Diminuir quantidade">−</button>
++          <input id="movement-quantity" type="number" inputmode="numeric" min="1" max="500" value="1">
++          <button type="button" id="qty-plus" aria-label="Aumentar quantidade">+</button>
++        </div>
++      </div>
++
++      <div id="counted-field" class="field hidden">
++        <label for="movement-counted">Contagem física (latas na geladeira)</label>
++        <input id="movement-counted" type="number" inputmode="numeric" min="0" max="10000">
++      </div>
++
++      <div id="buyer-field" class="field">
++        <label for="movement-buyer">Quem comprou <span class="required">*</span></label>
++        <input id="movement-buyer" maxlength="80" autocomplete="off" placeholder="Nome do comprador">
++      </div>
++
++      <div id="email-field" class="field">
++        <label for="movement-email">E-mail do comprador <span class="optional">(opcional)</span></label>
++        <input id="movement-email" type="email" maxlength="254" autocomplete="off" placeholder="nome@exemplo.com">
++      </div>
++
++      <div class="field">
++        <label for="movement-note">Observação <span class="optional" id="note-optional">(opcional)</span></label>
++        <textarea id="movement-note" maxlength="500" rows="2" placeholder="Ex.: lote recebido, lata amassada…"></textarea>
++      </div>
++
++      <p id="movement-preview" class="preview" aria-live="polite"></p>
++      <p id="movement-error" class="form-error" role="alert" aria-live="assertive"></p>
++
++      <footer class="dialog-actions">
++        <button type="button" class="ghost-button" data-close>Cancelar</button>
++        <button type="submit" id="movement-submit" class="primary-button">
++          <span class="button-label">Confirmar</span>
++          <span class="button-loader" aria-hidden="true"></span>
++        </button>
++      </footer>
++    </form>
++  </dialog>
++
++  <div id="toast" class="toast" role="status" aria-live="polite"></div>
++  <script src="/static/estoque/estoque.js?v=20261009-1" defer></script>
++</body>
++</html>
+diff --git a/docs/plano-acao-estoque.md b/docs/plano-acao-estoque.md
+new file mode 100644
+index 0000000..6f7d5b7
+--- /dev/null
++++ b/docs/plano-acao-estoque.md
+@@ -0,0 +1,188 @@
++# Plano de ação — Controle de estoque do marketplace Red Bull (CITi)
++
++**Base:** branch `main` do `FKomata/redbull_compra_citi` (commit `0feecef`, head Alembic `7e03d1bf5a42`).
++**Entrega:** revisão Alembic `c3f8a1d27b54`, painel `/estoque`, scripts SQL e testes.
++
++## 1. Situação
++
++- O código do controle de estoque foi perdido. O marketplace (PDV) continua funcionando, mas depende de `products.stock` e `products.reserved_stock`, e hoje não há ferramenta para repor latas, registrar vendas fora do PIX ou auditar saídas.
++- Sem ferramenta, a única forma de mexer no estoque seria `UPDATE` manual, o que o próprio projeto proíbe e que não deixa rastro.
++- O banco institucional ainda tem as tabelas `users` e `stock_adjustments`, que provavelmente vieram do sistema perdido. Elas **não são alteradas** por esta entrega.
++
++## 2. Objetivo e critérios de pronto
++
++| # | Critério | Como é atendido |
++|---|----------|-----------------|
++| 1 | Banco registra **quem comprou, quantas latas saíram e o horário** | Tabela `stock_movements` + trigger `trg_products_stock_ledger` |
++| 2 | Vendas do marketplace entram no registro sem trabalho manual | `payment_service` informa o pedido ao trigger na mesma transação do pagamento |
++| 3 | Plataforma visual com **todos os sabores** do marketplace | Painel `/estoque` lista `products` com as mesmas imagens do PDV |
++| 4 | Botões **adicionar (+)** e **decrementar (−)** que alteram o banco | `POST /api/estoque/movimentos` com lock de linha e validação |
++| 5 | **Tela de login** | `staff_users` + `staff_sessions`, senha com scrypt, cookie HttpOnly |
++| 6 | Não quebrar o PDV nem o histórico do banco institucional | 113 testes passando (85 da main + 28 novos); `alembic check` sem diferenças |
++
++## 3. Fluxo da solução
++
++```mermaid
++flowchart LR
++    subgraph Marketplace ["PDV / marketplace"]
++        A[Comprador escolhe sabores] --> B[Pedido PENDING<br/>reserved_stock +N]
++        B --> C{Pagamento PIX}
++        C -- aprovado --> D[payment_service<br/>stock −N, reserved −N]
++        C -- expirou/cancelou --> E[reserved −N<br/>estoque não muda]
++    end
++    subgraph Painel ["Painel /estoque"]
++        L[Login do operador] --> P[Cards dos sabores]
++        P -- "botão Entrada (+)" --> R[RESTOCK stock +N]
++        P -- "botão Saída (−)" --> S[MANUAL_SALE ou LOSS stock −N]
++        P -- "Ajustar contagem<br/>(admin)" --> J[ADJUSTMENT stock = contagem]
++    end
++    D -- contexto: pedido --> T
++    R -- contexto: operador --> T
++    S -- contexto: operador + comprador --> T
++    J -- contexto: operador + motivo --> T
++    X[UPDATE manual via SQL] -- sem contexto --> T
++    T[(trigger trg_products_stock_ledger)] --> M[(stock_movements<br/>quem · quanto · quando)]
++    M --> V[views e relatórios<br/>vw_saidas_estoque]
++```
++
++Pontos-chave:
++
++1. **Reserva não é saída.** Quando o comprador gera o PIX, só `reserved_stock` sobe. A saída acontece quando o pagamento é aprovado; é nesse momento que a linha `MARKETPLACE_SALE` é gravada com nome, e-mail, pedido e preço unitário.
++2. **O banco é a fonte da verdade do histórico.** A aplicação só diz *quem/por quê* via `set_config('redbull.stock_context', …, true)`; o trigger grava a linha. Qualquer caminho que mude `products.stock` (webhook, reconciliação, painel, SQL manual) fica registrado.
++3. **O trigger nunca bloqueia uma venda.** Se o contexto vier inválido ou incoerente, a linha é gravada como `UNTRACKED` com uma observação, em vez de abortar o pagamento. A função é `SECURITY DEFINER` (com `search_path` fixo), então funciona mesmo se a role da aplicação não tiver permissão direta em `stock_movements`.
++4. **O painel não mexe em latas reservadas.** Uma saída manual não pode deixar `stock < reserved_stock`, então quem está pagando um PIX nunca perde a lata.
++5. **O painel nunca altera estoque sem registro.** Depois de mudar o estoque, o painel confere a linha que o trigger gravou; se ela não existir ou não bater, a transação inteira é desfeita.
++
++## 4. Modelo de dados
++
++### `stock_movements` — livro-razão (uma linha por alteração de estoque)
++
++| Coluna | Para quê |
++|--------|----------|
++| `created_at` | **horário da saída/entrada** (timestamptz; views mostram em America/Recife) |
++| `product_id`, `product_name` | sabor (nome congelado no momento) |
++| `movement_type` | `MARKETPLACE_SALE`, `MANUAL_SALE`, `LOSS`, `RESTOCK`, `ADJUSTMENT`, `INITIAL_STOCK`, `UNTRACKED` |
++| `source` | `MARKETPLACE`, `PAINEL` ou `BANCO` |
++| `quantity`, `delta` | **quantas latas** (absoluto e com sinal) |
++| `stock_before`, `stock_after`, `reserved_stock_after` | saldo antes/depois, para conferência |
++| `buyer_name`, `buyer_email` | **quem comprou** (do pedido ou digitado no painel) |
++| `order_id`, `unit_price` | pedido do marketplace e preço pago |
++| `staff_user_id` | operador que lançou no painel |
++| `note`, `db_user` | observação e usuário do banco que executou |
++
++Restrições garantem coerência: `stock_after = stock_before + delta`, venda/perda sempre negativa, reposição sempre positiva, venda manual sempre com comprador.
++
++Nos totais do dia (painel e relatórios), **saídas** = vendas no marketplace + vendas manuais + perdas; **entradas** = reposições. Ajustes de inventário aparecem no histórico, mas não entram nesses totais.
++
++### `staff_users` e `staff_sessions` — login do painel
++
++- `staff_users`: `username` (único, minúsculo), `full_name`, `password_hash` (scrypt com salt), `role` (`ADMIN` ou `OPERADOR`), `active`, bloqueio por tentativas.
++- `staff_sessions`: guarda só o SHA-256 do token do cookie, com expiração (12 h padrão) e revogação no logout.
++
++### Views
++
++- `vw_estoque_atual` — estoque físico, reservado e disponível por sabor.
++- `vw_movimentacoes_estoque` — histórico completo em português, com operador e horário local.
++- `vw_saidas_estoque` — só as saídas (o relatório "quem comprou, quanto, quando").
++
++## 5. Operação do dia a dia
++
++| Situação | Quem | Onde | Resultado no banco |
++|----------|------|------|--------------------|
++| Chegaram latas | Operador | Card do sabor → **+ Entrada** | `RESTOCK` com operador e observação |
++| Alguém comprou em dinheiro/fora do PIX | Operador | **− Saída** → *Venda* (nome obrigatório) | `MANUAL_SALE` com comprador |
++| Lata amassada, vencida, sumiu | Operador | **− Saída** → *Perda* | `LOSS` com observação |
++| Contagem física diferente do sistema | Admin | **Ajustar contagem** (motivo obrigatório) | `ADJUSTMENT` com o delta |
++| Compra pelo QR Code | Ninguém | automático | `MARKETPLACE_SALE` com nome, e-mail, pedido e preço |
++| Fechamento do dia/mês | Admin | `sql/consultas_estoque.sql` | relatórios prontos |
++
++Recomendação: contagem física semanal pelo admin, e conferir a consulta 8 (`UNTRACKED`) e a consulta 9 (integridade) do arquivo de relatórios.
++
++## 6. Plano de implantação
++
++### Fase 0 — Preparar (dev, ~1 h)
++
++- [ ] Aplicar o patch numa branch nova a partir da `main` (`git am entrega_estoque/0001-*.patch`).
++- [ ] `pip install -r requirements.txt` (nenhuma dependência nova).
++- [ ] `docker compose up -d postgres_test && pytest` → esperado **113 passed**.
++
++### Fase 1 — Homologar numa cópia do banco institucional (~1 h)
++
++- [ ] Restaurar um backup recente do banco institucional num banco de teste.
++- [ ] `alembic current` → deve ser `7e03d1bf5a42` (se não for, **parar** e aplicar antes as revisões pendentes da main).
++- [ ] `alembic upgrade head` → `c3f8a1d27b54`.
++- [ ] Conferir que `users` e `stock_adjustments` continuam com as mesmas linhas (consulta 10 de `sql/consultas_estoque.sql`).
++- [ ] `alembic downgrade -1` e `alembic upgrade head` de novo (precisa funcionar ida e volta).
++- [ ] Rodar `sql/seed_sabores.sql` e conferir se nenhum sabor duplicou (o script pula ids e nomes já existentes).
++- [ ] Criar um admin, entrar em `/estoque`, lançar uma entrada, uma saída e fazer uma compra mock.
++
++### Fase 2 — Produção (janela curta, ~30 min)
++
++- [ ] Confirmar backup/ponto de restauração do banco institucional.
++- [ ] Configurar no Render: `STOCK_SESSION_COOKIE_SECURE=true` (já é o padrão) e, se quiser, `STOCK_SESSION_TTL_HOURS`.
++- [ ] `alembic upgrade head` no banco institucional (com autorização explícita).
++- [ ] Rodar `sql/seed_sabores.sql` **somente se** faltarem sabores no PDV.
++- [ ] Deploy do backend/frontend.
++- [ ] `python -m scripts.create_staff_user --username … --name "…" --role ADMIN` para cada admin; `--role OPERADOR` para os demais.
++
++### Fase 3 — Carga inicial e validação (~30 min)
++
++- [ ] Contar as latas físicas e lançar via **Ajustar contagem** (ou **+ Entrada** se o estoque estiver zerado), com motivo "Inventário inicial".
++- [ ] Fazer uma compra real de 1 lata pelo QR Code e conferir no painel: a linha `Marketplace` aparece com o nome do comprador e o horário.
++- [ ] Rodar a consulta 9 (integridade): resultado esperado `diferenca = 0` em todos os sabores.
++
++### Rollback
++
++`alembic downgrade -1` remove apenas as tabelas, trigger e views novas (**apaga o histórico de movimentações e os operadores**). O PDV continua funcionando como antes. Exporte `vw_movimentacoes_estoque` antes, se quiser guardar o histórico.
++
++## 7. Riscos e mitigação
++
++| Risco | Mitigação |
++|-------|-----------|
++| Banco institucional fora da head esperada | Checklist da Fase 1 para antes de qualquer `upgrade`; nunca usar `alembic stamp head` |
++| Duplicar sabor ao rodar o seed | Seed compara id **e** nome normalizado; insere com estoque 0 |
++| Operador tirar lata que está reservada num PIX | Validação no servidor: `stock` nunca fica abaixo de `reserved_stock` |
++| Dois operadores mexendo no mesmo sabor | `SELECT … FOR UPDATE` no produto (teste de concorrência incluso) |
++| Correção manual por SQL sem rastro | Trigger grava `UNTRACKED` com `db_user`; consulta 8 lista essas linhas |
++| Senha vazada ou força bruta | scrypt (fora do event loop) + bloqueio da conta após 5 erros por 15 min + limite de 20 falhas por IP a cada 10 min; cookie HttpOnly/SameSite=Strict/Secure; cabeçalho anti-CSRF; CSP na página |
++| Operador saiu do CITi | `create_staff_user --deactivate` revoga as sessões na hora |
++
++## 8. Próximos passos sugeridos (backlog)
++
++1. Tela de administração de operadores no próprio painel (hoje é pela CLI).
++2. Exportar CSV das saídas por período direto do painel.
++3. Alerta (e-mail/Slack) quando um sabor ficar com estoque baixo.
++4. Decidir se vale importar o histórico de `stock_adjustments` para `stock_movements` (consulta 10 mostra a estrutura).
++5. Restringir no Postgres: o usuário da aplicação sem `UPDATE`/`DELETE` em `stock_movements` (livro-razão somente inserção).
++
++## 9. Arquivos
++
++| Arquivo | Conteúdo |
++|---------|----------|
++| `app/db/migrations/versions/c3f8a1d27b54_add_stock_control_ledger.py` | Migration: tabelas, trigger e views |
++| `sql/estoque_schema.sql` | Mesmo modelo em SQL puro (idempotente) |
++| `sql/seed_sabores.sql` | Catálogo dos 12 sabores (opcional, seguro) |
++| `sql/consultas_estoque.sql` | Relatórios: saídas do dia, quem comprou, ranking, integridade |
++| `app/stock_service.py` | Regras de estoque e contexto do livro-razão |
++| `app/staff_auth.py` | Login, sessões, hash de senha, CSRF, bloqueio |
++| `app/stock_panel.py` | Rotas `/estoque` e `/api/estoque/*` |
++| `app/static/estoque/` | CSS e JS do painel (sem build) |
++| `scripts/create_staff_user.py` | CLI para criar/desativar operadores |
++| `tests/test_stock_panel.py`, `tests/test_stock_schema_sql.py` | 28 testes novos (login, permissões, concorrência, marketplace, trigger) |
++| `scripts/export_stock_schema_sql.py` | Regera `sql/estoque_schema.sql` a partir da migration |
++| `app/templates/estoque.html` | Página do painel (servida só em `/estoque`, com CSP) |
++| Alterados: `app/db/models.py`, `app/models.py`, `app/main.py`, `app/payment_service.py`, `app/store.py`, `tests/test_migrations.py`, `README.md`, `.env.example` | Integração com o que já existe |
++
++### API do painel
++
++| Método | Rota | Uso |
++|--------|------|-----|
++| `POST` | `/api/estoque/login` | entrar (define o cookie) |
++| `POST` | `/api/estoque/logout` | sair (revoga a sessão) |
++| `GET` | `/api/estoque/me` | operador logado |
++| `GET` | `/api/estoque/produtos` | sabores com estoque físico, reservado, disponível e saídas do dia |
++| `POST` | `/api/estoque/movimentos` | lançar entrada, saída, perda ou ajuste |
++| `GET` | `/api/estoque/movimentos` | histórico (`direction=in/out`, `product_id`, paginação por `before_id`) |
++| `GET` | `/api/estoque/resumo` | totais do dia |
++
++Rotas `POST` exigem o cabeçalho `X-Requested-With: estoque-panel`.
+diff --git a/scripts/create_staff_user.py b/scripts/create_staff_user.py
+new file mode 100644
+index 0000000..2909f64
+--- /dev/null
++++ b/scripts/create_staff_user.py
+@@ -0,0 +1,164 @@
++"""Cria ou atualiza operadores do painel de estoque.
++
++Exemplos:
++
++    # cria um administrador (a senha é pedida no terminal, sem eco)
++    python -m scripts.create_staff_user --username felipe --name "Felipe Komata" --role ADMIN
++
++    # cria um operador
++    python -m scripts.create_staff_user --username caixa01 --name "Caixa 01"
++
++    # redefine a senha e desbloqueia
++    python -m scripts.create_staff_user --username caixa01 --reset-password
++
++    # desativa (revoga as sessões abertas)
++    python -m scripts.create_staff_user --username caixa01 --deactivate
++
++Para automação, a senha pode vir pela entrada padrão com --password-stdin.
++A senha nunca é aceita como argumento de linha de comando (ficaria no histórico).
++"""
++
++import argparse
++import asyncio
++import getpass
++import sys
++from datetime import UTC, datetime
++
++from sqlalchemy import select, update
++
++from app.db.base import AsyncSessionLocal, engine
++from app.db.models import StaffSessionORM, StaffUserORM
++from app.models import StaffRole, normalize_username
++from app.staff_auth import MIN_PASSWORD_LENGTH, hash_password
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser(
++        description="Cria ou atualiza operadores do painel de estoque (/estoque).",
++    )
++    parser.add_argument("--username", required=True, help="login (minúsculas, 3–50)")
++    parser.add_argument("--name", help="nome completo exibido no painel")
++    parser.add_argument(
++        "--role",
++        choices=[role.value for role in StaffRole],
++        help="ADMIN pode ajustar inventário; OPERADOR lança entradas e saídas",
++    )
++    action = parser.add_mutually_exclusive_group()
++    action.add_argument("--reset-password", action="store_true")
++    action.add_argument("--deactivate", action="store_true")
++    action.add_argument("--activate", action="store_true")
++    parser.add_argument(
++        "--password-stdin",
++        action="store_true",
++        help="lê a senha da primeira linha da entrada padrão",
++    )
++    return parser.parse_args()
++
++
++def read_password(from_stdin: bool) -> str:
++    if from_stdin:
++        password = sys.stdin.readline().rstrip("\n")
++    else:
++        password = getpass.getpass("Senha: ")
++        if getpass.getpass("Repita a senha: ") != password:
++            raise SystemExit("As senhas não conferem.")
++    if len(password) < MIN_PASSWORD_LENGTH:
++        raise SystemExit(f"A senha precisa ter pelo menos {MIN_PASSWORD_LENGTH} caracteres.")
++    return password
++
++
++async def run(args: argparse.Namespace) -> int:
++    try:
++        username = normalize_username(args.username)
++    except ValueError as exc:
++        raise SystemExit(str(exc)) from exc
++    if (args.deactivate or args.activate) and args.password_stdin:
++        raise SystemExit("--password-stdin só faz sentido ao criar ou redefinir senha.")
++
++    async with AsyncSessionLocal() as db:
++        exists = (
++            await db.execute(
++                select(StaffUserORM.id).where(StaffUserORM.username == username)
++            )
++        ).scalar_one_or_none() is not None
++
++    if not exists and (args.reset_password or args.deactivate or args.activate):
++        raise SystemExit(f"Usuário '{username}' não existe.")
++
++    # A senha é lida antes de abrir a transação: nenhum lock fica preso
++    # enquanto o terminal espera a digitação.
++    password_hash = None
++    if args.reset_password or (not exists and not (args.deactivate or args.activate)):
++        if not exists and (not args.name or len(args.name.strip()) < 2):
++            raise SystemExit("Informe --name para criar o usuário.")
++        password_hash = hash_password(read_password(args.password_stdin))
++
++    now = datetime.now(UTC)
++    async with AsyncSessionLocal() as db, db.begin():
++        user = (
++            await db.execute(
++                select(StaffUserORM)
++                .where(StaffUserORM.username == username)
++                .with_for_update(key_share=True)
++            )
++        ).scalar_one_or_none()
++
++        if user is None:
++            if args.reset_password or args.deactivate or args.activate:
++                raise SystemExit(f"Usuário '{username}' não existe.")
++            if password_hash is None:
++                raise SystemExit(f"Usuário '{username}' foi removido; rode o comando de novo.")
++            db.add(
++                StaffUserORM(
++                    username=username,
++                    full_name=args.name.strip()[:120],
++                    password_hash=password_hash,
++                    role=args.role or StaffRole.OPERADOR.value,
++                    active=True,
++                )
++            )
++            print(f"Usuário '{username}' criado ({args.role or StaffRole.OPERADOR.value}).")
++            return 0
++
++        if args.reset_password:
++            user.password_hash = password_hash
++            user.failed_login_attempts = 0
++            user.locked_until = None
++        if args.deactivate:
++            user.active = False
++        if args.activate:
++            user.active = True
++            user.failed_login_attempts = 0
++            user.locked_until = None
++        if args.name:
++            user.full_name = args.name.strip()[:120]
++        if args.role:
++            user.role = args.role
++        user.updated_at = now
++
++        if args.reset_password or args.deactivate:
++            await db.execute(
++                update(StaffSessionORM)
++                .where(
++                    StaffSessionORM.staff_user_id == user.id,
++                    StaffSessionORM.revoked_at.is_(None),
++                )
++                .values(revoked_at=now)
++            )
++        print(f"Usuário '{username}' atualizado.")
++    return 0
++
++
++async def run_and_dispose(args: argparse.Namespace) -> int:
++    try:
++        return await run(args)
++    finally:
++        await engine.dispose()
++
++
++def main() -> None:
++    raise SystemExit(asyncio.run(run_and_dispose(parse_args())))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/export_stock_schema_sql.py b/scripts/export_stock_schema_sql.py
+new file mode 100644
+index 0000000..2428472
+--- /dev/null
++++ b/scripts/export_stock_schema_sql.py
+@@ -0,0 +1,57 @@
++"""Regera sql/estoque_schema.sql a partir da migration c3f8a1d27b54.
++
++    python -m scripts.export_stock_schema_sql
++
++O arquivo SQL é a mesma lista de comandos da migration, para revisão e
++aplicação manual. tests/test_stock_schema_sql.py falha se os dois divergirem.
++"""
++
++import importlib.util
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++MIGRATION = ROOT / "app/db/migrations/versions/c3f8a1d27b54_add_stock_control_ledger.py"
++OUTPUT = ROOT / "sql/estoque_schema.sql"
++
++HEADER = """-- =====================================================================
++-- Controle de estoque Red Bull CITi — modelo de dados (PostgreSQL 11+)
++--
++-- Mesmo conteúdo da revisão Alembic c3f8a1d27b54 (parte de 7e03d1bf5a42).
++-- Caminho recomendado:  alembic upgrade head
++-- Este arquivo existe para revisão, diagramas (DBeaver/pgAdmin) e para
++-- quem precisar aplicar o modelo manualmente. É idempotente: pode ser
++-- executado de novo sem erro, e o `alembic upgrade head` posterior
++-- também funciona (usa IF NOT EXISTS / CREATE OR REPLACE).
++--
++-- Pré-requisito: tabelas products, orders e order_items do marketplace
++-- (ou seja, o banco precisa estar na revisão 7e03d1bf5a42).
++--
++-- NÃO altera: users, stock_adjustments, products.description/color/price.
++--
++-- Tabelas criadas:
++--   staff_users      operadores do painel /estoque (login)
++--   staff_sessions   sessões de login (só o hash do token)
++--   stock_movements  livro-razão: quem comprou, quantas latas saíram e quando
++-- Trigger:
++--   trg_products_stock_ledger  registra TODA alteração de products.stock
++-- Views:
++--   vw_estoque_atual, vw_movimentacoes_estoque, vw_saidas_estoque
++--
++-- Gerado a partir de UPGRADE_STATEMENTS da migration; não edite à mão sem
++-- alterar a migration (tests/test_stock_schema_sql.py confere os dois).
++-- =====================================================================
++
++"""
++
++
++def main() -> None:
++    spec = importlib.util.spec_from_file_location("stock_ledger_migration", MIGRATION)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    body = "\n".join(statement.strip() + ";\n" for statement in module.UPGRADE_STATEMENTS)
++    OUTPUT.write_text(HEADER + "BEGIN;\n\n" + body + "\nCOMMIT;\n", encoding="utf-8")
++    print(f"{OUTPUT.relative_to(ROOT)} atualizado ({len(module.UPGRADE_STATEMENTS)} comandos).")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/sql/consultas_estoque.sql b/sql/consultas_estoque.sql
+new file mode 100644
+index 0000000..94f0035
+--- /dev/null
++++ b/sql/consultas_estoque.sql
+@@ -0,0 +1,126 @@
++-- =====================================================================
++-- Consultas de estoque (somente leitura) — Red Bull CITi
++-- Horários exibidos no fuso America/Recife.
++-- Rode trechos individuais no psql, DBeaver ou pgAdmin.
++-- =====================================================================
++
++-- 1) Estoque atual por sabor --------------------------------------------
++SELECT produto_id, sabor, categoria,
++       estoque_fisico, reservado_pix, disponivel_marketplace,
++       ultima_movimentacao AT TIME ZONE 'America/Recife' AS ultima_movimentacao
++  FROM vw_estoque_atual
++ ORDER BY categoria, sabor;
++
++
++-- Observação: vw_saidas_estoque traz toda redução de estoque. As consultas
++-- abaixo filtram por tipo para contar só saídas reais de latas (vendas e
++-- perdas); ajustes de inventário ficam de fora dos totais.
++
++-- 2) Saídas de hoje: quem comprou, quantas latas e a que horas -------------
++SELECT to_char(horario_recife, 'HH24:MI') AS hora,
++       sabor, quantidade, tipo_descricao, comprador, email_comprador,
++       valor_total, operador_nome, observacao, pedido_id
++  FROM vw_saidas_estoque
++ WHERE horario_recife >= date_trunc('day', now() AT TIME ZONE 'America/Recife')
++   AND tipo IN ('MARKETPLACE_SALE', 'MANUAL_SALE', 'LOSS')
++ ORDER BY horario_recife DESC;
++
++
++-- 3) Saídas em um período (ajuste as datas) ------------------------------
++SELECT horario_recife, sabor, quantidade, tipo_descricao, comprador,
++       email_comprador, preco_unitario, valor_total, operador_nome, observacao
++  FROM vw_saidas_estoque
++ WHERE horario_recife >= DATE '2026-10-01'
++   AND horario_recife <  DATE '2026-11-01'
++   AND tipo IN ('MARKETPLACE_SALE', 'MANUAL_SALE', 'LOSS')
++ ORDER BY horario_recife;
++
++
++-- 4) Sabores que mais saíram nos últimos 30 dias ------------------------
++SELECT sabor,
++       sum(quantidade)                                            AS latas,
++       sum(quantidade) FILTER (WHERE tipo = 'MARKETPLACE_SALE')   AS marketplace,
++       sum(quantidade) FILTER (WHERE tipo = 'MANUAL_SALE')        AS venda_manual,
++       sum(quantidade) FILTER (WHERE tipo = 'LOSS')               AS perdas,
++       sum(valor_total)                                           AS faturamento_marketplace
++  FROM vw_saidas_estoque
++ WHERE horario_utc >= now() - interval '30 days'
++   AND tipo IN ('MARKETPLACE_SALE', 'MANUAL_SALE', 'LOSS')
++ GROUP BY sabor
++ ORDER BY latas DESC;
++
++
++-- 5) Compras por pessoa (marketplace + venda manual) --------------------
++SELECT coalesce(email_comprador, lower(comprador))  AS comprador_chave,
++       max(comprador)                               AS comprador,
++       count(DISTINCT coalesce(pedido_id::text, id::text)) AS compras,
++       sum(quantidade)                              AS latas,
++       max(horario_recife)                          AS ultima_compra
++  FROM vw_saidas_estoque
++ WHERE tipo IN ('MARKETPLACE_SALE', 'MANUAL_SALE')
++ GROUP BY 1
++ ORDER BY latas DESC;
++
++
++-- 6) Saídas por dia ------------------------------------------------------
++SELECT horario_recife::date AS dia,
++       sum(quantidade) AS latas,
++       sum(quantidade) FILTER (WHERE tipo = 'MARKETPLACE_SALE') AS marketplace,
++       sum(quantidade) FILTER (WHERE tipo = 'MANUAL_SALE')      AS manual,
++       sum(quantidade) FILTER (WHERE tipo = 'LOSS')             AS perdas
++  FROM vw_saidas_estoque
++ WHERE tipo IN ('MARKETPLACE_SALE', 'MANUAL_SALE', 'LOSS')
++ GROUP BY 1
++ ORDER BY 1 DESC;
++
++
++-- 7) Lançamentos por operador do painel ----------------------------------
++SELECT operador_nome, tipo_descricao, count(*) AS lancamentos, sum(quantidade) AS latas
++  FROM vw_movimentacoes_estoque
++ WHERE origem = 'PAINEL'
++ GROUP BY operador_nome, tipo_descricao
++ ORDER BY operador_nome, tipo_descricao;
++
++
++-- 8) Alterações feitas fora do sistema (investigar) -----------------------
++-- Toda mudança em products.stock sem contexto da aplicação (ex.: UPDATE
++-- manual) aparece como UNTRACKED, com o usuário do banco que a executou.
++SELECT horario_recife, sabor, delta, estoque_antes, estoque_depois,
++       usuario_banco, observacao
++  FROM vw_movimentacoes_estoque
++ WHERE tipo = 'UNTRACKED'
++ ORDER BY horario_recife DESC;
++
++
++-- 9) Conferência de integridade: estoque x livro-razão --------------------
++-- Para cada sabor com histórico, o estoque_depois da última movimentação
++-- deve ser igual ao estoque atual. "diferenca" diferente de zero indica
++-- alteração que escapou do trigger (não deveria acontecer).
++SELECT p.id, p.name, p.stock AS estoque_atual,
++       ultima.stock_after AS estoque_no_razao,
++       p.stock - ultima.stock_after AS diferenca
++  FROM products AS p
++  JOIN LATERAL (
++        SELECT m.stock_after
++          FROM stock_movements AS m
++         WHERE m.product_id = p.id
++         ORDER BY m.id DESC
++         LIMIT 1
++  ) AS ultima ON true
++ ORDER BY abs(p.stock - ultima.stock_after) DESC, p.name;
++
++
++-- 10) Tabelas legadas do controle de estoque antigo ----------------------
++-- users e stock_adjustments vieram do sistema perdido e são preservadas.
++-- Existem só no banco institucional (numa instalação nova a 2ª consulta
++-- falha com "relation does not exist", o que é esperado).
++-- Use estas consultas para decidir se vale importar o histórico.
++SELECT table_name, column_name, data_type, is_nullable
++  FROM information_schema.columns
++ WHERE table_schema = current_schema()
++   AND table_name IN ('users', 'stock_adjustments')
++ ORDER BY table_name, ordinal_position;
++
++SELECT 'users' AS tabela, count(*) AS linhas FROM users
++UNION ALL
++SELECT 'stock_adjustments', count(*) FROM stock_adjustments;
+diff --git a/sql/estoque_schema.sql b/sql/estoque_schema.sql
+new file mode 100644
+index 0000000..6daa09a
+--- /dev/null
++++ b/sql/estoque_schema.sql
+@@ -0,0 +1,330 @@
++-- =====================================================================
++-- Controle de estoque Red Bull CITi — modelo de dados (PostgreSQL 11+)
++--
++-- Mesmo conteúdo da revisão Alembic c3f8a1d27b54 (parte de 7e03d1bf5a42).
++-- Caminho recomendado:  alembic upgrade head
++-- Este arquivo existe para revisão, diagramas (DBeaver/pgAdmin) e para
++-- quem precisar aplicar o modelo manualmente. É idempotente: pode ser
++-- executado de novo sem erro, e o `alembic upgrade head` posterior
++-- também funciona (usa IF NOT EXISTS / CREATE OR REPLACE).
++--
++-- Pré-requisito: tabelas products, orders e order_items do marketplace
++-- (ou seja, o banco precisa estar na revisão 7e03d1bf5a42).
++--
++-- NÃO altera: users, stock_adjustments, products.description/color/price.
++--
++-- Tabelas criadas:
++--   staff_users      operadores do painel /estoque (login)
++--   staff_sessions   sessões de login (só o hash do token)
++--   stock_movements  livro-razão: quem comprou, quantas latas saíram e quando
++-- Trigger:
++--   trg_products_stock_ledger  registra TODA alteração de products.stock
++-- Views:
++--   vw_estoque_atual, vw_movimentacoes_estoque, vw_saidas_estoque
++--
++-- Gerado a partir de UPGRADE_STATEMENTS da migration; não edite à mão sem
++-- alterar a migration (tests/test_stock_schema_sql.py confere os dois).
++-- =====================================================================
++
++BEGIN;
++
++CREATE TABLE IF NOT EXISTS staff_users (
++    id                     BIGSERIAL    PRIMARY KEY,
++    username               VARCHAR(50)  NOT NULL,
++    full_name              VARCHAR(120) NOT NULL,
++    password_hash          VARCHAR(255) NOT NULL,
++    role                   VARCHAR(20)  NOT NULL DEFAULT 'OPERADOR',
++    active                 BOOLEAN      NOT NULL DEFAULT true,
++    failed_login_attempts  INTEGER      NOT NULL DEFAULT 0,
++    locked_until           TIMESTAMPTZ,
++    last_login_at          TIMESTAMPTZ,
++    created_at             TIMESTAMPTZ  NOT NULL DEFAULT now(),
++    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT now(),
++    CONSTRAINT uq_staff_users_username UNIQUE (username),
++    CONSTRAINT ck_staff_users_role CHECK (role IN ('ADMIN', 'OPERADOR')),
++    CONSTRAINT ck_staff_users_username_format
++        CHECK (username ~ '^[a-z0-9._-]{3,50}$'),
++    CONSTRAINT ck_staff_users_failed_login_attempts
++        CHECK (failed_login_attempts >= 0)
++);
++
++COMMENT ON TABLE staff_users IS
++    'Operadores do painel de estoque. Senha guardada apenas como hash scrypt.';
++
++CREATE TABLE IF NOT EXISTS staff_sessions (
++    id             BIGSERIAL    PRIMARY KEY,
++    staff_user_id  BIGINT       NOT NULL,
++    token_hash     VARCHAR(64)  NOT NULL,
++    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
++    expires_at     TIMESTAMPTZ  NOT NULL,
++    revoked_at     TIMESTAMPTZ,
++    user_agent     VARCHAR(255),
++    ip_address     VARCHAR(45),
++    CONSTRAINT uq_staff_sessions_token_hash UNIQUE (token_hash),
++    CONSTRAINT fk_staff_sessions_staff_user_id
++        FOREIGN KEY (staff_user_id) REFERENCES staff_users (id) ON DELETE CASCADE
++);
++
++CREATE INDEX IF NOT EXISTS ix_staff_sessions_staff_user_id
++    ON staff_sessions (staff_user_id);
++
++COMMENT ON TABLE staff_sessions IS
++    'Sessões do painel de estoque. O token do cookie nunca é salvo, só o SHA-256.';
++
++CREATE TABLE IF NOT EXISTS stock_movements (
++    id                    BIGSERIAL      PRIMARY KEY,
++    product_id            VARCHAR(50)    NOT NULL,
++    product_name          VARCHAR(120)   NOT NULL,
++    movement_type         VARCHAR(30)    NOT NULL,
++    source                VARCHAR(20)    NOT NULL,
++    quantity              INTEGER        NOT NULL,
++    delta                 INTEGER        NOT NULL,
++    stock_before          INTEGER        NOT NULL,
++    stock_after           INTEGER        NOT NULL,
++    reserved_stock_after  INTEGER        NOT NULL,
++    order_id              UUID,
++    staff_user_id         BIGINT,
++    buyer_name            VARCHAR(80),
++    buyer_email           VARCHAR(254),
++    unit_price            NUMERIC(10, 2),
++    note                  VARCHAR(500),
++    db_user               VARCHAR(63)    NOT NULL DEFAULT session_user,
++    created_at            TIMESTAMPTZ    NOT NULL DEFAULT now(),
++    CONSTRAINT fk_stock_movements_product_id
++        FOREIGN KEY (product_id) REFERENCES products (id),
++    CONSTRAINT fk_stock_movements_order_id
++        FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE SET NULL,
++    CONSTRAINT fk_stock_movements_staff_user_id
++        FOREIGN KEY (staff_user_id) REFERENCES staff_users (id),
++    CONSTRAINT ck_stock_movements_type CHECK (
++        movement_type IN (
++            'INITIAL_STOCK', 'RESTOCK', 'MANUAL_SALE', 'LOSS',
++            'ADJUSTMENT', 'MARKETPLACE_SALE', 'UNTRACKED'
++        )
++    ),
++    CONSTRAINT ck_stock_movements_source
++        CHECK (source IN ('PAINEL', 'MARKETPLACE', 'BANCO')),
++    CONSTRAINT ck_stock_movements_quantity
++        CHECK (quantity > 0 AND quantity = abs(delta)),
++    CONSTRAINT ck_stock_movements_balance
++        CHECK (stock_after = stock_before + delta),
++    CONSTRAINT ck_stock_movements_direction CHECK (
++        (movement_type IN ('INITIAL_STOCK', 'RESTOCK') AND delta > 0)
++        OR (movement_type IN ('MANUAL_SALE', 'LOSS', 'MARKETPLACE_SALE') AND delta < 0)
++        OR movement_type IN ('ADJUSTMENT', 'UNTRACKED')
++    ),
++    CONSTRAINT ck_stock_movements_manual_sale_buyer
++        CHECK (movement_type <> 'MANUAL_SALE' OR buyer_name IS NOT NULL)
++);
++
++CREATE INDEX IF NOT EXISTS ix_stock_movements_product_id_created_at
++    ON stock_movements (product_id, created_at);
++
++CREATE INDEX IF NOT EXISTS ix_stock_movements_created_at
++    ON stock_movements (created_at);
++
++CREATE INDEX IF NOT EXISTS ix_stock_movements_order_id
++    ON stock_movements (order_id);
++
++CREATE INDEX IF NOT EXISTS ix_stock_movements_staff_user_id
++    ON stock_movements (staff_user_id);
++
++COMMENT ON TABLE stock_movements IS
++    'Livro-razão de estoque: uma linha por alteração de products.stock. Preenchido pelo trigger trg_products_stock_ledger.';
++
++CREATE OR REPLACE FUNCTION fn_stock_movements_ledger()
++RETURNS trigger
++LANGUAGE plpgsql
++SECURITY DEFINER
++AS $fn$
++DECLARE
++    v_raw          text;
++    v_ctx          jsonb := '{}'::jsonb;
++    v_before       integer;
++    v_delta        integer;
++    v_type         text;
++    v_source       text;
++    v_order_id     uuid;
++    v_staff_id     bigint;
++    v_buyer_name   text;
++    v_buyer_email  text;
++    v_unit_price   numeric(10, 2);
++    v_note         text;
++BEGIN
++    IF TG_OP = 'INSERT' THEN
++        v_before := 0;
++    ELSE
++        v_before := OLD.stock;
++    END IF;
++    v_delta := NEW.stock - v_before;
++    IF v_delta = 0 THEN
++        RETURN NEW;
++    END IF;
++
++    -- Cada parte do contexto é lida isoladamente: um campo ruim não apaga
++    -- os demais (principalmente o operador) e nunca aborta a transação.
++    BEGIN
++        v_raw := current_setting('redbull.stock_context', true);
++        IF v_raw IS NOT NULL AND btrim(v_raw) <> '' THEN
++            v_ctx := v_raw::jsonb;
++        END IF;
++    EXCEPTION WHEN others THEN
++        v_ctx := '{}'::jsonb;
++        v_note := '[contexto de estoque inválido ignorado]';
++    END;
++    IF jsonb_typeof(v_ctx) IS DISTINCT FROM 'object' THEN
++        v_ctx := '{}'::jsonb;
++    END IF;
++
++    v_type := v_ctx ->> 'movement_type';
++    v_source := v_ctx ->> 'source';
++    v_buyer_name := left(NULLIF(btrim(v_ctx ->> 'buyer_name'), ''), 80);
++    v_buyer_email := left(NULLIF(btrim(v_ctx ->> 'buyer_email'), ''), 254);
++    v_note := concat_ws(' ', v_note, NULLIF(btrim(v_ctx ->> 'note'), ''));
++    BEGIN
++        v_order_id := NULLIF(v_ctx ->> 'order_id', '')::uuid;
++    EXCEPTION WHEN others THEN
++        v_order_id := NULL;
++    END;
++    BEGIN
++        v_staff_id := NULLIF(v_ctx ->> 'staff_user_id', '')::bigint;
++    EXCEPTION WHEN others THEN
++        v_staff_id := NULL;
++    END;
++    BEGIN
++        v_unit_price := NULLIF(v_ctx ->> 'unit_price', '')::numeric(10, 2);
++    EXCEPTION WHEN others THEN
++        v_unit_price := NULL;
++    END;
++
++    IF v_type IS NULL THEN
++        v_type := CASE WHEN TG_OP = 'INSERT' THEN 'INITIAL_STOCK' ELSE 'UNTRACKED' END;
++    END IF;
++    IF v_source IS NULL OR v_source NOT IN ('PAINEL', 'MARKETPLACE', 'BANCO') THEN
++        v_source := 'BANCO';
++    END IF;
++
++    IF NOT (
++        (v_type IN ('INITIAL_STOCK', 'RESTOCK') AND v_delta > 0)
++        OR (v_type IN ('MANUAL_SALE', 'LOSS', 'MARKETPLACE_SALE') AND v_delta < 0)
++        OR v_type IN ('ADJUSTMENT', 'UNTRACKED')
++    ) OR (v_type = 'MANUAL_SALE' AND v_buyer_name IS NULL) THEN
++        v_note := concat_ws(' ', '[tipo ' || left(v_type, 40) || ' incompatível com a alteração]', v_note);
++        v_type := 'UNTRACKED';
++    END IF;
++
++    IF v_order_id IS NOT NULL THEN
++        SELECT COALESCE(v_buyer_name, left(o.buyer_name, 80)),
++               COALESCE(v_buyer_email, left(o.payer_email, 254))
++          INTO v_buyer_name, v_buyer_email
++          FROM orders AS o
++         WHERE o.id = v_order_id;
++        IF NOT FOUND THEN
++            v_order_id := NULL;
++        ELSE
++            SELECT COALESCE(v_unit_price, max(item.unit_price))
++              INTO v_unit_price
++              FROM order_items AS item
++             WHERE item.order_id = v_order_id
++               AND item.product_id = NEW.id;
++        END IF;
++    END IF;
++
++    IF v_staff_id IS NOT NULL
++       AND NOT EXISTS (SELECT 1 FROM staff_users WHERE id = v_staff_id) THEN
++        v_staff_id := NULL;
++    END IF;
++
++    INSERT INTO stock_movements (
++        product_id, product_name, movement_type, source,
++        quantity, delta, stock_before, stock_after, reserved_stock_after,
++        order_id, staff_user_id, buyer_name, buyer_email, unit_price, note, db_user
++    ) VALUES (
++        NEW.id, left(NEW.name, 120), v_type, v_source,
++        abs(v_delta), v_delta, v_before, NEW.stock, NEW.reserved_stock,
++        v_order_id, v_staff_id, v_buyer_name, v_buyer_email, v_unit_price,
++        left(NULLIF(v_note, ''), 500), left(session_user, 63)
++    );
++    RETURN NEW;
++END;
++$fn$;
++
++DO $sp$
++BEGIN
++    EXECUTE format(
++        'ALTER FUNCTION fn_stock_movements_ledger() SET search_path = %I, pg_temp',
++        current_schema()
++    );
++END
++$sp$;
++
++REVOKE ALL ON FUNCTION fn_stock_movements_ledger() FROM PUBLIC;
++
++DROP TRIGGER IF EXISTS trg_products_stock_ledger ON products;
++
++CREATE TRIGGER trg_products_stock_ledger
++    AFTER INSERT OR UPDATE OF stock ON products
++    FOR EACH ROW
++    EXECUTE FUNCTION fn_stock_movements_ledger();
++
++CREATE OR REPLACE VIEW vw_estoque_atual AS
++SELECT
++    p.id                         AS produto_id,
++    p.name                       AS sabor,
++    p.category                   AS categoria,
++    p.stock                      AS estoque_fisico,
++    p.reserved_stock             AS reservado_pix,
++    p.stock - p.reserved_stock   AS disponivel_marketplace,
++    ultima.created_at            AS ultima_movimentacao
++FROM products AS p
++LEFT JOIN LATERAL (
++    SELECT m.created_at
++      FROM stock_movements AS m
++     WHERE m.product_id = p.id
++     ORDER BY m.created_at DESC, m.id DESC
++     LIMIT 1
++) AS ultima ON true;
++
++CREATE OR REPLACE VIEW vw_movimentacoes_estoque AS
++SELECT
++    m.id,
++    m.created_at                                  AS horario_utc,
++    (m.created_at AT TIME ZONE 'America/Recife')  AS horario_recife,
++    m.product_id                                  AS produto_id,
++    m.product_name                                AS sabor,
++    m.movement_type                               AS tipo,
++    CASE m.movement_type
++        WHEN 'INITIAL_STOCK'    THEN 'Estoque inicial'
++        WHEN 'RESTOCK'          THEN 'Reposição'
++        WHEN 'MANUAL_SALE'      THEN 'Venda manual'
++        WHEN 'LOSS'             THEN 'Perda/avaria'
++        WHEN 'ADJUSTMENT'       THEN 'Ajuste de inventário'
++        WHEN 'MARKETPLACE_SALE' THEN 'Venda no marketplace'
++        ELSE 'Alteração sem contexto'
++    END                                           AS tipo_descricao,
++    m.source                                      AS origem,
++    CASE WHEN m.delta < 0 THEN 'SAIDA' ELSE 'ENTRADA' END AS direcao,
++    m.quantity                                    AS quantidade,
++    m.delta,
++    m.stock_before                                AS estoque_antes,
++    m.stock_after                                 AS estoque_depois,
++    m.buyer_name                                  AS comprador,
++    m.buyer_email                                 AS email_comprador,
++    m.order_id                                    AS pedido_id,
++    o.paid_at                                     AS pago_em,
++    m.unit_price                                  AS preco_unitario,
++    m.unit_price * m.quantity                     AS valor_total,
++    su.username                                   AS operador_usuario,
++    su.full_name                                  AS operador_nome,
++    m.note                                        AS observacao,
++    m.db_user                                     AS usuario_banco
++FROM stock_movements AS m
++LEFT JOIN orders AS o ON o.id = m.order_id
++LEFT JOIN staff_users AS su ON su.id = m.staff_user_id;
++
++CREATE OR REPLACE VIEW vw_saidas_estoque AS
++SELECT *
++  FROM vw_movimentacoes_estoque
++ WHERE delta < 0;
++
++COMMIT;
+diff --git a/sql/seed_sabores.sql b/sql/seed_sabores.sql
+new file mode 100644
+index 0000000..6540dee
+--- /dev/null
++++ b/sql/seed_sabores.sql
+@@ -0,0 +1,92 @@
++-- =====================================================================
++-- Catálogo de sabores Red Bull do marketplace CITi (OPCIONAL)
++--
++-- Cadastra os 12 sabores que o PDV já sabe exibir (imagens em
++-- app/static/assets). Rode só depois de `alembic upgrade head`.
++--
++-- Seguro para rodar mais de uma vez e no banco institucional:
++--   * não altera sabores existentes (nem estoque, nem nome);
++--   * pula o sabor se já existir um produto com o mesmo id OU com o
++--     mesmo nome normalizado (sem acento/maiúsculas/espaços), evitando
++--     duplicar um sabor cadastrado com outro id;
++--   * todos entram com estoque 0 — use o painel /estoque (botão
++--     "+ Entrada") para lançar as latas, assim a entrada fica registrada
++--     com o operador responsável;
++--   * funciona com ou sem as colunas legadas products.description,
++--     products.color e products.price.
++--
++-- Uso: psql "$DATABASE_URL_SEM_ASYNCPG" -f sql/seed_sabores.sql
++-- =====================================================================
++
++BEGIN;
++
++DO $seed$
++DECLARE
++    v_has_legacy boolean;
++    v_flavor     record;
++    v_inserted   integer := 0;
++    v_skipped    integer := 0;
++BEGIN
++    SELECT count(*) = 3
++      INTO v_has_legacy
++      FROM information_schema.columns
++     WHERE table_schema = current_schema()
++       AND table_name = 'products'
++       AND column_name IN ('description', 'color', 'price');
++
++    FOR v_flavor IN
++        SELECT *
++          FROM (VALUES
++            ('original',              'Energy Original',        'Regular',   'O clássico que dá asas.',          '#164194'),
++            ('tropical',              'Tropical',               'Regular',   'Sabor tropical e refrescante.',    '#f5c400'),
++            ('melancia',              'Melancia',               'Regular',   'Leve, frutado e marcante.',        '#e7354f'),
++            ('nectarina',             'Nectarina',              'Regular',   'Edição de verão de nectarina.',    '#f28c28'),
++            ('melao_e_maracuja',      'Melão e Maracujá',       'Regular',   'Melão com maracujá.',              '#7cc242'),
++            ('morango_e_pessego',     'Morango e Pêssego',      'Regular',   'Morango com pêssego.',             '#e8506e'),
++            ('zero_tradicional',      'Tradicional Zero',       'Zero',      'Zero açúcar e zero calorias.',     '#9aa3ad'),
++            ('tradicional_sugarfree', 'Tradicional Sugarfree',  'Sugarfree', 'Sem açúcar.',                      '#4fb3e8'),
++            ('nectarina_sugarfree',   'Nectarina Sugarfree',    'Sugarfree', 'Nectarina sem açúcar.',            '#f5a25d'),
++            ('pomelo_sugarfree',      'Pomelo Sugarfree',       'Sugarfree', 'Pomelo sem açúcar.',               '#f07c8c'),
++            ('amora_sugarfree',       'Amora Sugarfree',        'Sugarfree', 'Amora sem açúcar.',                '#7b4fa0'),
++            ('maca_sugarfree',        'Maçã Sugarfree',         'Sugarfree', 'Maçã sem açúcar.',                 '#8cc63f')
++          ) AS f(id, name, category, description, color)
++    LOOP
++        IF EXISTS (
++            SELECT 1
++              FROM products AS p
++             WHERE p.id = v_flavor.id
++                OR regexp_replace(
++                       lower(translate(p.name, 'áàâãäéèêëíìîïóòôõöúùûüçÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ',
++                                               'aaaaaeeeeiiiiooooouuuucaaaaaeeeeiiiiooooouuuuc')),
++                       '[^a-z0-9]+', '', 'g')
++                 = regexp_replace(
++                       lower(translate(v_flavor.name, 'áàâãäéèêëíìîïóòôõöúùûüçÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ',
++                                                      'aaaaaeeeeiiiiooooouuuucaaaaaeeeeiiiiooooouuuuc')),
++                       '[^a-z0-9]+', '', 'g')
++        ) THEN
++            v_skipped := v_skipped + 1;
++            CONTINUE;
++        END IF;
++
++        IF v_has_legacy THEN
++            -- Instalações criadas do zero ainda têm as colunas legadas NOT NULL.
++            INSERT INTO products (id, name, category, stock, reserved_stock, description, color, price)
++            VALUES (v_flavor.id, v_flavor.name, v_flavor.category, 0, 0,
++                    v_flavor.description, v_flavor.color, 8.50);
++        ELSE
++            INSERT INTO products (id, name, category, stock, reserved_stock)
++            VALUES (v_flavor.id, v_flavor.name, v_flavor.category, 0, 0);
++        END IF;
++        v_inserted := v_inserted + 1;
++    END LOOP;
++
++    RAISE NOTICE 'Sabores cadastrados: %, já existentes (ignorados): %', v_inserted, v_skipped;
++END
++$seed$;
++
++COMMIT;
++
++-- Conferência
++SELECT produto_id, sabor, categoria, estoque_fisico, disponivel_marketplace
++  FROM vw_estoque_atual
++ ORDER BY categoria, sabor;
+diff --git a/tests/test_migrations.py b/tests/test_migrations.py
+index 20e5de7..06e8816 100644
+--- a/tests/test_migrations.py
++++ b/tests/test_migrations.py
+@@ -9,7 +9,8 @@ from app.db.base import engine
+ 
+ def test_alembic_has_one_explicit_merge_head():
+     scripts = ScriptDirectory.from_config(Config("alembic.ini"))
+-    assert scripts.get_heads() == ["7e03d1bf5a42"]
++    assert scripts.get_heads() == ["c3f8a1d27b54"]
++    assert scripts.get_revision("c3f8a1d27b54").down_revision == "7e03d1bf5a42"
+     revision = scripts.get_revision("4c7b91e2a6d0")
+     assert revision.down_revision == "e91a7c4d2f30"
+ 
+diff --git a/tests/test_stock_panel.py b/tests/test_stock_panel.py
+new file mode 100644
+index 0000000..8683871
+--- /dev/null
++++ b/tests/test_stock_panel.py
+@@ -0,0 +1,582 @@
++import asyncio
++from decimal import Decimal
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlalchemy import delete, select, text, update
++
++from app.db.base import AsyncSessionLocal, engine
++from app.db.models import (
++    OrderORM,
++    PriceTierORM,
++    ProductORM,
++    StaffSessionORM,
++    StaffUserORM,
++    StockMovementORM,
++)
++from app.main import app
++from app.models import StaffRole, StaffUser, StockMovementCreate, StockMovementType
++from app.staff_auth import (
++    CSRF_HEADER_VALUE,
++    SESSION_COOKIE_NAME,
++    hash_password,
++    login_throttle,
++    verify_password,
++)
++from app.stock_service import apply_panel_movement
++
++
++INITIAL_STOCK = {"original": 24, "tropical": 18, "melancia": 16}
++PANEL = {"X-Requested-With": CSRF_HEADER_VALUE}
++PASSWORD = "senha-segura-123"
++
++
++def run(coro):
++    """Executa uma corrotina num loop novo sem reaproveitar conexões de outro loop."""
++    asyncio.run(engine.dispose())
++    try:
++        return asyncio.run(coro)
++    finally:
++        asyncio.run(engine.dispose())
++
++
++async def reset_stock_database() -> dict[str, int]:
++    async with AsyncSessionLocal() as session, session.begin():
++        await session.execute(delete(StockMovementORM))
++        await session.execute(delete(StaffSessionORM))
++        await session.execute(delete(StaffUserORM))
++        await session.execute(delete(OrderORM))
++        await session.execute(update(PriceTierORM).values(active=True))
++        for product_id, stock in INITIAL_STOCK.items():
++            await session.execute(
++                update(ProductORM)
++                .where(ProductORM.id == product_id)
++                .values(stock=stock, reserved_stock=0)
++            )
++        # O reset acima também passa pelo trigger; começamos com o razão vazio.
++        await session.execute(delete(StockMovementORM))
++        ids = {}
++        for username, role in (("admin", StaffRole.ADMIN), ("caixa", StaffRole.OPERADOR)):
++            user = StaffUserORM(
++                username=username,
++                full_name=f"Usuário {username}",
++                password_hash=hash_password(PASSWORD),
++                role=role.value,
++            )
++            session.add(user)
++            await session.flush()
++            ids[username] = user.id
++    return ids
++
++
++async def fetch_movements(product_id: str | None = None) -> list[StockMovementORM]:
++    async with AsyncSessionLocal() as session:
++        query = select(StockMovementORM).order_by(StockMovementORM.id)
++        if product_id:
++            query = query.where(StockMovementORM.product_id == product_id)
++        return list((await session.execute(query)).scalars())
++
++
++async def product_stock(product_id: str) -> tuple[int, int]:
++    async with AsyncSessionLocal() as session:
++        product = await session.get(ProductORM, product_id)
++        return product.stock, product.reserved_stock
++
++
++@pytest.fixture()
++def staff_ids(monkeypatch):
++    monkeypatch.setenv("STOCK_SESSION_COOKIE_SECURE", "false")
++    login_throttle.clear()
++    yield run(reset_stock_database())
++    login_throttle.clear()
++
++
++@pytest.fixture()
++def client(staff_ids):
++    with TestClient(app) as test_client:
++        yield test_client
++    asyncio.run(engine.dispose())
++
++
++def login(client: TestClient, username: str = "admin", password: str = PASSWORD):
++    return client.post(
++        "/api/estoque/login",
++        json={"username": username, "password": password},
++        headers=PANEL,
++    )
++
++
++def post_movement(client: TestClient, **payload):
++    return client.post("/api/estoque/movimentos", json=payload, headers=PANEL)
++
++
++# --- Senhas e login ---------------------------------------------------------
++
++
++def test_password_hash_roundtrip_and_rejects_short_passwords():
++    stored = hash_password("uma-senha-boa")
++    assert stored.startswith("scrypt$")
++    assert "uma-senha-boa" not in stored
++    assert verify_password("uma-senha-boa", stored)
++    assert not verify_password("outra-senha", stored)
++    assert not verify_password("uma-senha-boa", "formato-invalido")
++    with pytest.raises(ValueError):
++        hash_password("curta")
++
++
++def test_panel_page_and_api_require_login(client):
++    page = client.get("/estoque")
++    assert page.status_code == 200
++    assert "Controle de" in page.text
++    for path in ("/api/estoque/me", "/api/estoque/produtos", "/api/estoque/movimentos", "/api/estoque/resumo"):
++        assert client.get(path).status_code == 401, path
++    assert post_movement(
++        client, product_id="original", movement_type="RESTOCK", quantity=1
++    ).status_code == 401
++
++
++def test_login_requires_panel_header(client):
++    response = client.post(
++        "/api/estoque/login",
++        json={"username": "admin", "password": PASSWORD},
++    )
++    assert response.status_code == 403
++
++
++def test_login_sets_hardened_cookie_and_logout_revokes_session(client):
++    assert login(client, password="errada-123").status_code == 401
++    response = login(client)
++    assert response.status_code == 200
++    assert response.json()["role"] == "ADMIN"
++    cookie = response.headers["set-cookie"].lower()
++    assert "httponly" in cookie
++    assert "samesite=strict" in cookie
++    token = client.cookies.get(SESSION_COOKIE_NAME)
++    assert token
++
++    async def stored_hashes():
++        async with AsyncSessionLocal() as session:
++            return list((await session.execute(select(StaffSessionORM.token_hash))).scalars())
++
++    hashes = run(stored_hashes())
++    assert hashes and token not in hashes
++
++    assert client.get("/api/estoque/me").json()["username"] == "admin"
++    assert client.post("/api/estoque/logout", headers=PANEL).status_code == 204
++    client.cookies.set(SESSION_COOKIE_NAME, token)
++    assert client.get("/api/estoque/me").status_code == 401
++
++
++def test_repeated_failures_lock_the_account(client, monkeypatch):
++    monkeypatch.setenv("STOCK_LOGIN_MAX_ATTEMPTS", "3")
++    for _ in range(3):
++        assert login(client, "caixa", "errada-123").status_code == 401
++    locked = login(client, "caixa", PASSWORD)
++    assert locked.status_code == 429
++
++
++def test_deactivated_user_loses_access(client, staff_ids):
++    assert login(client, "caixa").status_code == 200
++
++    async def deactivate():
++        async with AsyncSessionLocal() as session, session.begin():
++            await session.execute(
++                update(StaffUserORM)
++                .where(StaffUserORM.id == staff_ids["caixa"])
++                .values(active=False)
++            )
++
++    run(deactivate())
++    assert client.get("/api/estoque/me").status_code == 401
++    assert login(client, "caixa").status_code == 401
++
++
++# --- Movimentações ---------------------------------------------------------
++
++
++def test_lists_all_flavors_with_physical_and_available_stock(client):
++    login(client)
++    products = client.get("/api/estoque/produtos").json()
++    assert {product["id"] for product in products} == set(INITIAL_STOCK)
++    tropical = next(product for product in products if product["id"] == "tropical")
++    assert tropical["stock"] == 18
++    assert tropical["available"] == 18
++    assert tropical["out_today"] == 0
++
++
++def test_restock_increments_stock_and_records_operator(client, staff_ids):
++    login(client, "caixa")
++    response = post_movement(
++        client,
++        product_id="original",
++        movement_type="RESTOCK",
++        quantity=6,
++        note="Lote da semana",
++    )
++    assert response.status_code == 201, response.text
++    body = response.json()
++    assert body["product"]["stock"] == 30
++    assert body["movement"]["delta"] == 6
++    assert body["movement"]["staff_username"] == "caixa"
++
++    movements = run(fetch_movements("original"))
++    assert len(movements) == 1
++    movement = movements[0]
++    assert movement.movement_type == "RESTOCK"
++    assert movement.source == "PAINEL"
++    assert movement.staff_user_id == staff_ids["caixa"]
++    assert (movement.stock_before, movement.stock_after) == (24, 30)
++    assert movement.note == "Lote da semana"
++    assert run(product_stock("original")) == (30, 0)
++
++
++def test_manual_sale_requires_buyer_and_records_who_bought(client):
++    login(client, "caixa")
++    missing = post_movement(
++        client, product_id="tropical", movement_type="MANUAL_SALE", quantity=2
++    )
++    assert missing.status_code == 422
++    assert run(fetch_movements()) == []
++
++    response = post_movement(
++        client,
++        product_id="tropical",
++        movement_type="MANUAL_SALE",
++        quantity=2,
++        buyer_name="  Ana Souza ",
++        buyer_email="Ana@Citi.org.br",
++    )
++    assert response.status_code == 201, response.text
++    movement = run(fetch_movements("tropical"))[0]
++    assert movement.delta == -2
++    assert movement.buyer_name == "Ana Souza"
++    assert movement.buyer_email == "ana@citi.org.br"
++    assert movement.created_at is not None
++    assert run(product_stock("tropical")) == (16, 0)
++
++    summary = client.get("/api/estoque/resumo").json()
++    assert summary["units_out_today"] == 2
++    assert summary["manual_sales_today"] == 2
++    history = client.get("/api/estoque/movimentos", params={"direction": "out"}).json()
++    assert history[0]["buyer_name"] == "Ana Souza"
++
++
++def test_cannot_remove_more_than_physical_stock(client):
++    login(client)
++    response = post_movement(
++        client, product_id="melancia", movement_type="LOSS", quantity=17
++    )
++    assert response.status_code == 409
++    assert run(product_stock("melancia")) == (16, 0)
++    assert run(fetch_movements()) == []
++
++
++def test_cannot_remove_units_reserved_for_pending_pix(client):
++    order = client.post(
++        "/api/orders",
++        json={
++            "buyer_name": "Comprador PIX",
++            "payer_email": "pix@example.com",
++            "pricing_audience": "MEMBER",
++            "items": [{"product_id": "melancia", "quantity": 10}],
++        },
++    )
++    assert order.status_code == 201
++    login(client)
++    blocked = post_movement(
++        client,
++        product_id="melancia",
++        movement_type="MANUAL_SALE",
++        quantity=7,
++        buyer_name="Outra pessoa",
++    )
++    assert blocked.status_code == 409
++    assert "reservadas" in blocked.json()["detail"]
++    allowed = post_movement(
++        client,
++        product_id="melancia",
++        movement_type="MANUAL_SALE",
++        quantity=6,
++        buyer_name="Outra pessoa",
++    )
++    assert allowed.status_code == 201
++    assert allowed.json()["product"]["available"] == 0
++    assert run(product_stock("melancia")) == (10, 10)
++
++
++def test_inventory_adjustment_is_admin_only_and_requires_reason(client):
++    login(client, "caixa")
++    forbidden = post_movement(
++        client,
++        product_id="original",
++        movement_type="ADJUSTMENT",
++        counted_stock=20,
++        note="Contagem",
++    )
++    assert forbidden.status_code == 403
++
++    login(client, "admin")
++    no_reason = post_movement(
++        client, product_id="original", movement_type="ADJUSTMENT", counted_stock=20
++    )
++    assert no_reason.status_code == 422
++    same = post_movement(
++        client,
++        product_id="original",
++        movement_type="ADJUSTMENT",
++        counted_stock=24,
++        note="Contagem",
++    )
++    assert same.status_code == 409
++    response = post_movement(
++        client,
++        product_id="original",
++        movement_type="ADJUSTMENT",
++        counted_stock=21,
++        note="Contagem semanal",
++    )
++    assert response.status_code == 201
++    assert response.json()["movement"]["delta"] == -3
++    assert run(product_stock("original")) == (21, 0)
++    # Ajuste é correção de inventário, não saída de latas.
++    summary = client.get("/api/estoque/resumo").json()
++    assert summary["units_out_today"] == 0
++    assert response.json()["product"]["out_today"] == 0
++
++
++def test_marketplace_types_cannot_be_posted_from_panel(client):
++    login(client)
++    response = post_movement(
++        client, product_id="original", movement_type="MARKETPLACE_SALE", quantity=1
++    )
++    assert response.status_code == 422
++
++
++# --- Integração com o marketplace ----------------------------------------------
++
++
++def test_paid_marketplace_order_is_recorded_with_buyer_and_time(client):
++    created = client.post(
++        "/api/orders",
++        json={
++            "buyer_name": "Carlos Andrade",
++            "payer_email": "carlos@example.com",
++            "pricing_audience": "MEMBER",
++            "items": [
++                {"product_id": "tropical", "quantity": 3},
++                {"product_id": "original", "quantity": 1},
++            ],
++        },
++    ).json()
++    assert run(fetch_movements()) == []  # reservar não é saída de estoque
++
++    paid = client.post(f"/api/mock/pay/{created['payment']['txid']}")
++    assert paid.status_code == 200
++    assert paid.json()["status"] == "PAID"
++
++    movements = run(fetch_movements())
++    assert sorted((m.product_id, m.delta) for m in movements) == [
++        ("original", -1),
++        ("tropical", -3),
++    ]
++    for movement in movements:
++        assert movement.movement_type == "MARKETPLACE_SALE"
++        assert movement.source == "MARKETPLACE"
++        assert str(movement.order_id) == created["id"]
++        assert movement.buyer_name == "Carlos Andrade"
++        assert movement.buyer_email == "carlos@example.com"
++        assert movement.unit_price == Decimal("7.50")
++        assert movement.staff_user_id is None
++
++    # Repetir a confirmação não gera novas linhas.
++    client.post(f"/api/mock/pay/{created['payment']['txid']}")
++    assert len(run(fetch_movements())) == 2
++
++
++def test_direct_sql_changes_are_still_audited_as_untracked(staff_ids):
++    async def direct_update():
++        async with AsyncSessionLocal() as session, session.begin():
++            await session.execute(
++                text("UPDATE products SET stock = stock - 4 WHERE id = 'original'")
++            )
++
++    run(direct_update())
++    movement = run(fetch_movements("original"))[0]
++    assert movement.movement_type == "UNTRACKED"
++    assert movement.source == "BANCO"
++    assert movement.delta == -4
++    assert movement.db_user
++
++
++def test_invalid_context_never_blocks_a_stock_change(staff_ids):
++    async def bad_context_update():
++        async with AsyncSessionLocal() as session, session.begin():
++            await session.execute(
++                text("SELECT set_config('redbull.stock_context', '{quebrado', true)")
++            )
++            await session.execute(
++                text("UPDATE products SET stock = stock - 1 WHERE id = 'tropical'")
++            )
++            await session.execute(
++                text(
++                    "SELECT set_config('redbull.stock_context', "
++                    "'{\"movement_type\": \"RESTOCK\"}', true)"
++                )
++            )
++            await session.execute(
++                text("UPDATE products SET stock = stock - 1 WHERE id = 'tropical'")
++            )
++
++    run(bad_context_update())
++    movements = run(fetch_movements("tropical"))
++    assert [m.movement_type for m in movements] == ["UNTRACKED", "UNTRACKED"]
++    assert "inválido" in movements[0].note
++    assert "incompatível" in movements[1].note
++    assert run(product_stock("tropical")) == (16, 0)
++
++
++def test_concurrent_sales_of_the_last_can_do_not_oversell(staff_ids):
++    async def scenario():
++        async with AsyncSessionLocal() as session, session.begin():
++            await session.execute(
++                update(ProductORM).where(ProductORM.id == "melancia").values(stock=1)
++            )
++        staff = StaffUser(
++            id=staff_ids["caixa"],
++            username="caixa",
++            full_name="Usuário caixa",
++            role=StaffRole.OPERADOR,
++        )
++
++        async def sell(buyer: str):
++            async with AsyncSessionLocal() as session:
++                try:
++                    await apply_panel_movement(
++                        session,
++                        StockMovementCreate(
++                            product_id="melancia",
++                            movement_type=StockMovementType.MANUAL_SALE,
++                            quantity=1,
++                            buyer_name=buyer,
++                        ),
++                        staff,
++                    )
++                    return "ok"
++                except Exception as exc:  # HTTPException 409
++                    return getattr(exc, "status_code", exc)
++
++        return await asyncio.gather(sell("Primeiro"), sell("Segundo"))
++
++    results = run(scenario())
++    assert sorted(results, key=str) == [409, "ok"]
++    assert run(product_stock("melancia")) == (0, 0)
++    sales = [m for m in run(fetch_movements("melancia")) if m.movement_type == "MANUAL_SALE"]
++    assert len(sales) == 1
++
++
++# --- Endurecimento -----------------------------------------------------------
++
++
++def test_panel_page_is_served_with_security_headers_only_from_its_route(client):
++    page = client.get("/estoque")
++    assert page.headers["x-frame-options"] == "DENY"
++    assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
++    assert client.get("/static/estoque/index.html").status_code == 404
++    assert client.get("/static/estoque/estoque.js").status_code == 200
++
++
++def test_non_ascii_session_cookie_is_rejected_not_crashing(client):
++    raw_cookie = f"{SESSION_COOKIE_NAME}=sessão-inválida".encode("utf-8")
++    response = client.get("/api/estoque/me", headers={b"cookie": raw_cookie})
++    assert response.status_code == 401
++
++
++def test_ip_is_throttled_after_repeated_failures(client, monkeypatch):
++    monkeypatch.setenv("STOCK_LOGIN_IP_MAX_FAILURES", "2")
++    assert login(client, "nao-existe", "x").status_code == 401
++    assert login(client, "outro-inexistente", "x").status_code == 401
++    assert login(client, "admin").status_code == 429
++
++
++@pytest.mark.parametrize(
++    "field,value",
++    [("buyer_name", "Ana\x00Souza"), ("buyer_name", "Ana\nSouza"), ("note", "nota\x00")],
++)
++def test_control_characters_are_rejected_before_reaching_the_ledger(client, field, value):
++    login(client, "caixa")
++    payload = {
++        "product_id": "tropical",
++        "movement_type": "MANUAL_SALE",
++        "quantity": 1,
++        "buyer_name": "Ana Souza",
++        field: value,
++    }
++    response = post_movement(client, **payload)
++    assert response.status_code == 422
++    assert run(fetch_movements()) == []
++    assert run(product_stock("tropical")) == (18, 0)
++
++
++def test_multiline_note_is_kept(client):
++    login(client, "caixa")
++    response = post_movement(
++        client,
++        product_id="tropical",
++        movement_type="LOSS",
++        quantity=1,
++        note="Lata amassada\nna entrega",
++    )
++    assert response.status_code == 201
++    assert run(fetch_movements("tropical"))[0].note == "Lata amassada\nna entrega"
++
++
++def test_ledger_trigger_works_for_a_role_without_grants_on_the_ledger(staff_ids):
++    """O trigger é SECURITY DEFINER: uma role da aplicação só com acesso a
++    products consegue vender, e a linha é gravada mesmo assim."""
++
++    async def scenario():
++        async with AsyncSessionLocal() as session, session.begin():
++            await session.execute(
++                text(
++                    "DO $$ BEGIN "
++                    "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'stock_ledger_probe') "
++                    "THEN CREATE ROLE stock_ledger_probe NOLOGIN; END IF; END $$"
++                )
++            )
++            await session.execute(text("GRANT USAGE ON SCHEMA public TO stock_ledger_probe"))
++            await session.execute(
++                text("GRANT SELECT, UPDATE ON products TO stock_ledger_probe")
++            )
++        async with AsyncSessionLocal() as session, session.begin():
++            await session.execute(text("SET LOCAL ROLE stock_ledger_probe"))
++            await session.execute(
++                text("UPDATE products SET stock = stock - 2 WHERE id = 'melancia'")
++            )
++
++    run(scenario())
++    movement = run(fetch_movements("melancia"))[0]
++    assert movement.delta == -2
++    assert movement.movement_type == "UNTRACKED"
++    assert run(product_stock("melancia")) == (14, 0)
++
++
++def test_panel_rolls_back_when_the_ledger_trigger_is_missing(client):
++    login(client, "caixa")
++
++    async def toggle(enabled: bool):
++        async with AsyncSessionLocal() as session, session.begin():
++            action = "ENABLE" if enabled else "DISABLE"
++            await session.execute(
++                text(f"ALTER TABLE products {action} TRIGGER trg_products_stock_ledger")
++            )
++
++    run(toggle(False))
++    try:
++        response = post_movement(
++            client, product_id="original", movement_type="RESTOCK", quantity=3
++        )
++    finally:
++        run(toggle(True))
++    assert response.status_code == 500
++    assert run(product_stock("original")) == (24, 0)
++    assert run(fetch_movements()) == []
+diff --git a/tests/test_stock_schema_sql.py b/tests/test_stock_schema_sql.py
+new file mode 100644
+index 0000000..2def9c7
+--- /dev/null
++++ b/tests/test_stock_schema_sql.py
+@@ -0,0 +1,38 @@
++import importlib.util
++import re
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++MIGRATION = ROOT / "app/db/migrations/versions/c3f8a1d27b54_add_stock_control_ledger.py"
++SCHEMA_SQL = ROOT / "sql/estoque_schema.sql"
++
++
++def _normalize(sql: str) -> str:
++    return re.sub(r"\s+", " ", sql).strip()
++
++
++def _load_migration():
++    spec = importlib.util.spec_from_file_location("stock_ledger_migration", MIGRATION)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_standalone_sql_matches_alembic_migration_in_order():
++    migration = _load_migration()
++    script = _normalize(SCHEMA_SQL.read_text(encoding="utf-8"))
++    position = 0
++    for statement in migration.UPGRADE_STATEMENTS:
++        found = script.find(_normalize(statement), position)
++        assert found >= 0, f"Comando ausente ou fora de ordem em sql/estoque_schema.sql:\n{statement[:120]}"
++        position = found
++
++
++def test_migration_preserves_external_tables():
++    migration = _load_migration()
++    every_statement = " ".join(
++        migration.UPGRADE_STATEMENTS + migration.DOWNGRADE_STATEMENTS
++    ).lower()
++    assert "stock_adjustments" not in every_statement
++    assert not re.search(r"\b(drop|alter|truncate)\s+table\s+(if exists\s+)?users\b", every_statement)
++    assert "alter table products" not in every_statement
+-- 
+2.43.0
+

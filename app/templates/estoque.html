@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#070d16">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Estoque Red Bull — CITi</title>
+  <link rel="stylesheet" href="/static/estoque/estoque.css?v=20261011-2">
+</head>
+<body>
+  <!-- Login -->
+  <main id="login-view" class="login-shell hidden" aria-labelledby="login-title">
+    <form id="login-form" class="login-card" novalidate>
+      <img class="login-logo" src="/static/assets/logo-citi-transparent.png?v=20260802-2" alt="CITi">
+      <p class="eyebrow">Área restrita</p>
+      <h1 id="login-title">Controle de <span>estoque</span></h1>
+      <p class="muted">Entre com seu usuário de operador para registrar entradas e saídas de Red Bull.</p>
+
+      <label for="login-username">Usuário</label>
+      <div class="input-wrap">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 21a8 8 0 0 0-16 0M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z"/></svg>
+        <input id="login-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="50" placeholder="seu.usuario">
+      </div>
+
+      <label for="login-password">Senha</label>
+      <div class="input-wrap">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M7 10V7a5 5 0 0 1 10 0v3M5 10h14v11H5z"/></svg>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required maxlength="200" placeholder="••••••••">
+      </div>
+
+      <p id="login-error" class="form-error" role="alert" aria-live="assertive"></p>
+
+      <button type="submit" id="login-submit" class="primary-button">
+        <span class="button-label">Entrar</span>
+        <span class="button-loader" aria-hidden="true"></span>
+      </button>
+    </form>
+  </main>
+
+  <!-- Painel -->
+  <div id="panel-view" class="panel-shell hidden">
+    <header class="topbar">
+      <div class="topbar-brand">
+        <img src="/static/assets/logo-citi-transparent.png?v=20260802-2" alt="CITi">
+        <div>
+          <p class="eyebrow">Red Bull no CITi</p>
+          <h1>Controle de <span>estoque</span></h1>
+        </div>
+      </div>
+      <div class="topbar-user">
+        <span class="user-chip"><b id="user-name">—</b><small id="user-role">—</small></span>
+        <button type="button" id="logout" class="ghost-button" aria-label="Sair do painel">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M15 17l5-5-5-5M20 12H9M12 21H5V3h7"/></svg>
+          <span class="logout-label">Sair</span>
+        </button>
+      </div>
+    </header>
+
+    <section class="kpis" aria-label="Resumo do dia">
+      <article class="kpi kpi-out"><small>Saíram hoje</small><b id="kpi-out">—</b><span id="kpi-out-detail">&nbsp;</span></article>
+      <article class="kpi"><small>Entraram hoje</small><b id="kpi-in">—</b><span>reposições lançadas</span></article>
+      <article class="kpi"><small>Estoque físico</small><b id="kpi-stock">—</b><span>latas no CITi</span></article>
+      <article class="kpi"><small>Disponível no marketplace</small><b id="kpi-available">—</b><span id="kpi-reserved">&nbsp;</span></article>
+    </section>
+
+    <section class="prices" aria-labelledby="prices-title">
+      <div class="section-head">
+        <h2 id="prices-title">Preços</h2>
+      </div>
+      <div id="price-tables" class="price-grid" aria-live="polite"></div>
+    </section>
+
+    <div class="panel-grid">
+      <section class="flavors" aria-labelledby="flavors-title">
+        <div class="section-head">
+          <h2 id="flavors-title">Sabores</h2>
+          <div class="filters" role="group" aria-label="Filtrar por categoria" id="category-filters"></div>
+        </div>
+        <div class="search-wrap">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m21 21-4.3-4.3M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z"/></svg>
+          <input id="search" type="search" placeholder="Buscar sabor" aria-label="Buscar sabor" autocomplete="off">
+        </div>
+        <div id="products" class="product-grid" aria-live="polite" aria-busy="true">
+          <div class="card skeleton"></div><div class="card skeleton"></div><div class="card skeleton"></div>
+        </div>
+      </section>
+
+      <section class="history" aria-labelledby="history-title">
+        <div class="section-head">
+          <h2 id="history-title">Movimentações</h2>
+          <div class="filters" role="group" aria-label="Filtrar movimentações">
+            <button type="button" class="chip active" data-direction="">Todas</button>
+            <button type="button" class="chip" data-direction="out">Saídas</button>
+            <button type="button" class="chip" data-direction="in">Entradas</button>
+          </div>
+        </div>
+        <ol id="history" class="history-list" aria-live="polite"></ol>
+        <button type="button" id="history-more" class="ghost-button wide hidden">Carregar mais</button>
+        <p class="muted small">Vendas pagas no marketplace aparecem aqui automaticamente.</p>
+      </section>
+    </div>
+  </div>
+
+  <!-- Lançamento de entrada/saída -->
+  <dialog id="movement-dialog" aria-labelledby="movement-title">
+    <form id="movement-form" method="dialog" novalidate>
+      <header class="dialog-head">
+        <div class="dialog-product">
+          <img id="movement-image" src="" alt="">
+          <div>
+            <p class="eyebrow" id="movement-eyebrow">Saída</p>
+            <h2 id="movement-title">—</h2>
+            <p class="muted small" id="movement-stock">—</p>
+          </div>
+        </div>
+        <button type="button" class="icon-button" data-close aria-label="Fechar">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </header>
+
+      <fieldset id="type-field" class="type-options">
+        <legend class="sr-only">Tipo de movimentação</legend>
+      </fieldset>
+
+      <div id="quantity-field" class="field">
+        <label for="movement-quantity">Quantidade</label>
+        <div class="stepper">
+          <button type="button" id="qty-minus" aria-label="Diminuir quantidade">−</button>
+          <input id="movement-quantity" type="number" inputmode="numeric" min="1" max="500" value="1">
+          <button type="button" id="qty-plus" aria-label="Aumentar quantidade">+</button>
+        </div>
+      </div>
+
+      <div id="counted-field" class="field hidden">
+        <label for="movement-counted">Contagem física (latas na geladeira)</label>
+        <input id="movement-counted" type="number" inputmode="numeric" min="0" max="10000">
+      </div>
+
+      <div id="buyer-field" class="field">
+        <label for="movement-buyer">Quem comprou <span class="required">*</span></label>
+        <input id="movement-buyer" maxlength="80" autocomplete="off" placeholder="Nome do comprador">
+      </div>
+
+      <div id="email-field" class="field">
+        <label for="movement-email">E-mail do comprador <span class="optional">(opcional)</span></label>
+        <input id="movement-email" type="email" maxlength="254" autocomplete="off" placeholder="nome@exemplo.com">
+      </div>
+
+      <div class="field">
+        <label for="movement-note">Observação <span class="optional" id="note-optional">(opcional)</span></label>
+        <textarea id="movement-note" maxlength="500" rows="2" placeholder="Ex.: lote recebido, lata amassada…"></textarea>
+      </div>
+
+      <p id="movement-preview" class="preview" aria-live="polite"></p>
+      <p id="movement-error" class="form-error" role="alert" aria-live="assertive"></p>
+
+      <footer class="dialog-actions">
+        <button type="button" class="ghost-button" data-close>Cancelar</button>
+        <button type="submit" id="movement-submit" class="primary-button">
+          <span class="button-label">Confirmar</span>
+          <span class="button-loader" aria-hidden="true"></span>
+        </button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/estoque/estoque.js?v=20261011-2" defer></script>
+</body>
+</html>

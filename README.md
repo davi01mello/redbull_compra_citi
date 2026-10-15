@@ -10,7 +10,7 @@ O e-mail do pagador não é uma variável de ambiente. Não configure `MERCADO_P
 
 Após o pagamento, o webhook assinado consulta `GET /v1/orders/{provider_order_id}`. A confirmação altera pedido, pagamento, reserva e estoque na mesma transação, com locks de linha e verificações de estado para impedir desconto duplicado. Uma reconciliação periódica consulta pagamentos pendentes antes da expiração, cobrindo webhooks perdidos ou consultas precoces.
 
-Nunca corrija somente `orders.status` nem desconte estoque diretamente por SQL. Use o comando de reconciliação, que reutiliza a transação central.
+Nunca corrija somente `orders.status` nem desconte estoque diretamente por SQL. Use o comando de reconciliação, que reutiliza a transação central. Entradas, saídas manuais e ajustes de estoque são feitos pelo painel `/estoque`.
 
 ## Configuração
 
@@ -42,6 +42,26 @@ uvicorn app.main:app --reload
 ```
 
 A aplicação fica em `http://127.0.0.1:8000` e a documentação em `/docs`.
+
+## Controle de estoque (`/estoque`)
+
+Painel com login para operadores registrarem entradas e saídas de Red Bull. Ele lista todos os sabores cadastrados em `products` (os mesmos do marketplace), mostra estoque físico, reservas PIX abertas e o que está disponível no PDV, e tem os botões **− Saída** (venda manual ou perda) e **+ Entrada** (reposição). Administradores também podem lançar um **ajuste de inventário** (contagem física).
+
+Toda alteração de `products.stock` fica registrada em `stock_movements` pelo trigger `trg_products_stock_ledger`, inclusive as vendas pagas no marketplace: quem comprou (nome e e-mail), quantas latas saíram, horário, pedido, preço unitário e operador. Alterações feitas direto por SQL também são registradas, como `UNTRACKED`. Use o painel para repor ou corrigir estoque; não faça `UPDATE products SET stock` manual.
+
+Primeiro acesso:
+
+```bash
+alembic upgrade head                      # cria staff_users, staff_sessions, stock_movements, trigger e views
+psql "$URL_DO_BANCO" -f sql/seed_sabores.sql   # opcional: cadastra os 12 sabores com estoque 0
+python -m scripts.create_staff_user --username seu.usuario --name "Seu Nome" --role ADMIN
+```
+
+Depois acesse `http://127.0.0.1:8000/estoque`. Em desenvolvimento sem HTTPS, defina `STOCK_SESSION_COOKIE_SECURE=false`.
+
+- Modelo de dados em SQL puro: `sql/estoque_schema.sql` (idêntico à revisão `c3f8a1d27b54`).
+- Relatórios prontos (saídas do dia, quem comprou, ranking de sabores, integridade): `sql/consultas_estoque.sql`.
+- Plano de ação e fluxo completo: `docs/plano-acao-estoque.md`.
 
 ## Alembic e banco institucional
 
