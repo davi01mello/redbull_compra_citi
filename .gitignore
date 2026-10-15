@@ -5,3 +5,16 @@ __pycache__/
 *.db
 .env
 /insp
+compose.override.yaml
+
+# Entrega temporária do estoque e saídas do Claude
+/entrega_estoque/
+/Claude outputs/
+
+# Backups de banco
+*.dump
+backup_*.sql
+
+# Outros arquivos de ambiente (menos o exemplo)
+.env.*
+!.env.example
